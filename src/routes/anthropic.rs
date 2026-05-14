@@ -13,6 +13,7 @@ use crate::transform::{
     anthropic_to_gemini, anthropic_to_openai, gemini_stream::GeminiStreamState,
     openai_stream::OpenAiStreamState, sse_parser::SseParser,
 };
+use crate::SignatureCache;
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
@@ -97,16 +98,21 @@ fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Ev
                         .as_str()
                         .unwrap_or("unknown")
                         .to_string();
+                    // Preserve _thought_signature for round-trip through Claude Code
+                    let mut content_block = json!({
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": {}
+                    });
+                    if let Some(sig) = block.get("_thought_signature") {
+                        content_block["_thought_signature"] = sig.clone();
+                    }
                     events.push(Ok(Event::default().event("content_block_start").data(
                         json!({
                             "type": "content_block_start",
                             "index": idx,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tool_id,
-                                "name": tool_name,
-                                "input": {}
-                            }
+                            "content_block": content_block
                         })
                         .to_string(),
                     )));
@@ -173,6 +179,7 @@ impl<T> futures::Stream for ReceiverStream<T> {
 fn stream_gemini(
     response: reqwest::Response,
     model: String,
+    signatures: SignatureCache,
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
@@ -214,6 +221,11 @@ fn stream_gemini(
                             return;
                         }
                     }
+                    // Still store any signatures we collected before the error
+                    let sigs = state.take_thought_signatures();
+                    for (tool_id, sig_val) in sigs {
+                        signatures.store_tool_signature(tool_id, sig_val).await;
+                    }
                     return;
                 }
             }
@@ -225,6 +237,12 @@ fn stream_gemini(
             if tx.send(Ok(event)).await.is_err() {
                 return;
             }
+        }
+
+        // Store thought signatures in server-side cache for round-trip
+        let sigs = state.take_thought_signatures();
+        for (tool_id, sig_val) in sigs {
+            signatures.store_tool_signature(tool_id, sig_val).await;
         }
     });
 
@@ -355,7 +373,7 @@ pub async fn messages(
                     .map(|t| t.as_slice())
                     .unwrap_or(&[]);
 
-                let gemini_contents = anthropic_to_gemini::messages_to_gemini(messages);
+                let gemini_contents = anthropic_to_gemini::messages_to_gemini(messages, &state.signatures).await;
 
                 let mut gemini_body = json!({
                     "contents": gemini_contents,
@@ -412,7 +430,7 @@ pub async fn messages(
                 }
 
                 let model_name_owned = model_name.to_string();
-                let sse = stream_gemini(resp, model_name_owned);
+                let sse = stream_gemini(resp, model_name_owned, state.signatures.clone());
                 return Ok(sse.into_response());
             }
 
@@ -552,7 +570,7 @@ pub async fn messages(
                 .map(|t| t.as_slice())
                 .unwrap_or(&[]);
 
-            let gemini_contents = anthropic_to_gemini::messages_to_gemini(messages);
+            let gemini_contents = anthropic_to_gemini::messages_to_gemini(messages, &state.signatures).await;
 
             let mut gemini_body = json!({
                 "contents": gemini_contents,
@@ -599,7 +617,7 @@ pub async fn messages(
                 ));
             }
 
-            anthropic_to_gemini::response_to_anthropic(&resp_body, model_name)
+            anthropic_to_gemini::response_to_anthropic(&resp_body, model_name, &state.signatures)
         }
 
         Publisher::Anthropic => {

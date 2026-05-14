@@ -23,6 +23,11 @@ pub struct GeminiStreamState {
     output_tokens: u64,
     started: bool,
     finished: bool,
+    /// Accumulated thought_signature values from functionCall parts.
+    /// These need to be preserved in the Anthropic tool_use blocks so that
+    /// when the client sends back tool_result, we can include them in the
+    /// Gemini functionResponse parts.
+    thought_signatures: Vec<(String, Value)>, // (tool_id, signature)
 }
 
 impl GeminiStreamState {
@@ -37,6 +42,7 @@ impl GeminiStreamState {
             output_tokens: 0,
             started: false,
             finished: false,
+            thought_signatures: Vec::new(),
         }
     }
 
@@ -81,7 +87,16 @@ impl GeminiStreamState {
                 if let Some(content) = first.get("content") {
                     if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
                         for part in parts {
-                            // Text content
+                            // Thought content — skip in output but preserve signature for round-trip
+                            // Gemini thinking models emit thought parts with thought_signature.
+                            // These are internal reasoning that should not be shown to the user,
+                            // but the thought_signature must be preserved for the next request.
+                            if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                                // Skip thought text from being sent to client
+                                continue;
+                            }
+
+                            // Text content (non-thought)
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
                                     if !self.text_block_open {
@@ -111,7 +126,13 @@ impl GeminiStreamState {
                                 let input = fc.get("args").unwrap_or(&Value::Null);
                                 let input_str = serde_json::to_string(input).unwrap_or_default();
 
-                                events.push(self.open_tool_block(&tool_id, name));
+                                // Preserve thoughtSignature for round-trip
+                                // Gemini uses camelCase: thoughtSignature
+                                let sig = part.get("thoughtSignature")
+                                    .or_else(|| part.get("thought_signature"))
+                                    .cloned();
+
+                                events.push(self.open_tool_block(&tool_id, name, sig.as_ref()));
 
                                 // Stream input JSON incrementally
                                 for chunk in input_str.as_bytes().chunks(64) {
@@ -121,6 +142,11 @@ impl GeminiStreamState {
 
                                 events.push(self.close_block());
                                 self.has_tool_use = true;
+
+                                // Store signature for later retrieval if needed
+                                if let Some(sig_val) = sig {
+                                    self.thought_signatures.push((tool_id, sig_val));
+                                }
                             }
                         }
                     }
@@ -134,6 +160,12 @@ impl GeminiStreamState {
         }
 
         events
+    }
+
+    /// Take the accumulated thought signatures, clearing them from this state.
+    /// Returns (tool_id, signature) pairs for storage in the server-side cache.
+    pub fn take_thought_signatures(&mut self) -> Vec<(String, Value)> {
+        std::mem::take(&mut self.thought_signatures)
     }
 
     /// Generate finish events: close any open block, then message_delta + message_stop.
@@ -231,20 +263,25 @@ impl GeminiStreamState {
             )
     }
 
-    fn open_tool_block(&mut self, tool_id: &str, name: &str) -> Event {
+    fn open_tool_block(&mut self, tool_id: &str, name: &str, thought_signature: Option<&Value>) -> Event {
         let idx = self.block_index;
+        let mut content_block = json!({
+            "type": "tool_use",
+            "id": tool_id,
+            "name": name,
+            "input": {}
+        });
+        // Preserve thought_signature as _thought_signature for round-trip
+        if let Some(sig) = thought_signature {
+            content_block["_thought_signature"] = sig.clone();
+        }
         Event::default()
             .event("content_block_start")
             .data(
                 json!({
                     "type": "content_block_start",
                     "index": idx,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": tool_id,
-                        "name": name,
-                        "input": {}
-                    }
+                    "content_block": content_block
                 })
                 .to_string(),
             )
