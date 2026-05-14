@@ -1,0 +1,6 @@
+/target
+config.yaml
+CONTEXT.md
+PROJECT.md
+.claude/
+settings.json

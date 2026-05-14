@@ -1,0 +1,65 @@
+# =============================================================================
+# Vertex AI Proxy — Contoh Konfigurasi
+# =============================================================================
+# 1. Copy file ini ke config.yaml:  cp config.example.yaml config.yaml
+# 2. Ganti master_key dengan key pilihan Anda sendiri
+# 3. Sesuaikan daftar model sesuai kebutuhan
+# =============================================================================
+
+# API key untuk mengakses proxy ini (wajib diisi)
+master_key: "sk-your-secret-key-here"
+
+# Model default yang digunakan jika client tidak menyebutkan model
+default_model: "gemini-2.5-flash"
+
+# =============================================================================
+# Daftar Model
+# =============================================================================
+# Setiap model punya 4 field:
+#   name        → Nama yang digunakan client (bebas)
+#   vertex_name → Nama model di Vertex AI (harus sesuai GCP)
+#   publisher   → Jenis publisher di Vertex AI:
+#                    google   → Gemini (publishers/google/models/...)
+#                    openapi  → Grok, GLM, dll (endpoints/openapi/...)
+#                    anthropic→ Claude (publishers/anthropic/models/...)
+#   region      → Region Vertex AI (global / us-central1 / dll)
+# =============================================================================
+
+models:
+  # --- Gemini (Google) ---
+  - name: "gemini-3.1-pro-preview"
+    vertex_name: "gemini-3.1-pro-preview"
+    publisher: "google"
+    region: "global"
+
+  - name: "gemini-3.1-flash-lite"
+    vertex_name: "gemini-3.1-flash-lite"
+    publisher: "google"
+    region: "global"
+
+  - name: "gemini-2.5-pro"
+    vertex_name: "gemini-2.5-pro"
+    publisher: "google"
+    region: "us-central1"
+
+  - name: "gemini-2.5-flash"
+    vertex_name: "gemini-2.5-flash"
+    publisher: "google"
+    region: "us-central1"
+
+  # --- Grok (xAI) via OpenAI endpoint ---
+  - name: "xai/grok-4.20-reasoning"
+    vertex_name: "xai/grok-4.20-reasoning"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "xai/grok-4.1-fast-reasoning"
+    vertex_name: "xai/grok-4.1-fast-reasoning"
+    publisher: "openapi"
+    region: "global"
+
+  # --- GLM (Zhipu AI) via OpenAI endpoint ---
+  - name: "zai-org/glm-5-maas"
+    vertex_name: "zai-org/glm-5-maas"
+    publisher: "openapi"
+    region: "global"
