@@ -222,10 +222,10 @@ fn stream_gemini(
                         }
                     }
                     // Still store any signatures we collected before the error
-                    let sigs = state.take_thought_signatures();
-                    for (tool_id, sig_val) in sigs {
-                        signatures.store_tool_signature(tool_id, sig_val).await;
-                    }
+                    let tool_sigs = state.take_tool_thought_signatures();
+                    let text_sigs = state.take_text_thought_signatures();
+                    signatures.store_tool_signatures_batch(tool_sigs).await;
+                    signatures.store_text_signatures_batch(text_sigs).await;
                     return;
                 }
             }
@@ -240,10 +240,10 @@ fn stream_gemini(
         }
 
         // Store thought signatures in server-side cache for round-trip
-        let sigs = state.take_thought_signatures();
-        for (tool_id, sig_val) in sigs {
-            signatures.store_tool_signature(tool_id, sig_val).await;
-        }
+        let tool_sigs = state.take_tool_thought_signatures();
+        let text_sigs = state.take_text_thought_signatures();
+        signatures.store_tool_signatures_batch(tool_sigs).await;
+        signatures.store_text_signatures_batch(text_sigs).await;
     });
 
     Sse::new(ReceiverStream { rx })
@@ -330,7 +330,7 @@ pub async fn messages(
         body.get("max_tokens").and_then(|t| t.as_u64())
     );
 
-    let resolved = resolve_model(&state.config, model_name).map_err(|e| {
+    let resolved = resolve_model(&state.config, &state.dynamic_models, model_name).await.map_err(|e| {
         (StatusCode::BAD_REQUEST, Json(json!({"error": e})))
     })?;
 
@@ -408,9 +408,7 @@ pub async fn messages(
 
                 let status = resp.status();
                 if !status.is_success() {
-                    // Error response is not SSE — parse as regular JSON
-                    let status_code =
-                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                    // FIX BUG 5: Return error as SSE stream (not JSON) when client expects streaming
                     let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
                     let error_msg = resp_body
                         .get("error")
@@ -423,10 +421,59 @@ pub async fn messages(
                         })
                         .unwrap_or("Unknown upstream error");
                     tracing::error!("Vertex AI streaming error {status}: {error_msg}");
-                    return Err((
-                        status_code,
-                        Json(json!({"error": {"type": "upstream_error", "message": error_msg}})),
-                    ));
+
+                    // Return error as SSE events so Claude Code can parse it correctly
+                    let msg_id = format!("msg_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
+                    let error_events: Vec<Result<Event, Infallible>> = vec![
+                        Ok(Event::default().event("message_start").data(
+                            json!({
+                                "type": "message_start",
+                                "message": {
+                                    "id": msg_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "model": model_name,
+                                    "content": [],
+                                    "stop_reason": null,
+                                    "stop_sequence": null,
+                                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                                }
+                            })
+                            .to_string(),
+                        )),
+                        Ok(Event::default().event("content_block_start").data(
+                            json!({
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": {"type": "text", "text": ""}
+                            })
+                            .to_string(),
+                        )),
+                        Ok(Event::default().event("content_block_delta").data(
+                            json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": format!("API Error: {} {}", status.as_u16(), error_msg)}
+                            })
+                            .to_string(),
+                        )),
+                        Ok(Event::default().event("content_block_stop").data(
+                            json!({"type": "content_block_stop", "index": 0}).to_string(),
+                        )),
+                        Ok(Event::default().event("message_delta").data(
+                            json!({
+                                "type": "message_delta",
+                                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                                "usage": {"output_tokens": 0}
+                            })
+                            .to_string(),
+                        )),
+                        Ok(Event::default().event("message_stop").data(
+                            json!({"type": "message_stop"}).to_string(),
+                        )),
+                    ];
+                    let sse = Sse::new(futures::stream::iter(error_events));
+                    return Ok(sse.into_response());
                 }
 
                 let model_name_owned = model_name.to_string();
@@ -471,8 +518,7 @@ pub async fn messages(
 
                 let status = resp.status();
                 if !status.is_success() {
-                    let status_code =
-                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                    // FIX BUG 5: Return error as SSE stream for OpenAPI too
                     let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
                     let error_msg = resp_body
                         .get("error")
@@ -485,10 +531,30 @@ pub async fn messages(
                         })
                         .unwrap_or("Unknown upstream error");
                     tracing::error!("Vertex AI streaming error {status}: {error_msg}");
-                    return Err((
-                        status_code,
-                        Json(json!({"error": {"type": "upstream_error", "message": error_msg}})),
-                    ));
+
+                    let msg_id = format!("msg_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
+                    let error_events: Vec<Result<Event, Infallible>> = vec![
+                        Ok(Event::default().event("message_start").data(
+                            json!({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "model": model_name, "content": [], "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}).to_string(),
+                        )),
+                        Ok(Event::default().event("content_block_start").data(
+                            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}).to_string(),
+                        )),
+                        Ok(Event::default().event("content_block_delta").data(
+                            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": format!("API Error: {} {}", status.as_u16(), error_msg)}}).to_string(),
+                        )),
+                        Ok(Event::default().event("content_block_stop").data(
+                            json!({"type": "content_block_stop", "index": 0}).to_string(),
+                        )),
+                        Ok(Event::default().event("message_delta").data(
+                            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 0}}).to_string(),
+                        )),
+                        Ok(Event::default().event("message_stop").data(
+                            json!({"type": "message_stop"}).to_string(),
+                        )),
+                    ];
+                    let sse = Sse::new(futures::stream::iter(error_events));
+                    return Ok(sse.into_response());
                 }
 
                 let model_name_owned = model_name.to_string();
@@ -617,7 +683,7 @@ pub async fn messages(
                 ));
             }
 
-            anthropic_to_gemini::response_to_anthropic(&resp_body, model_name, &state.signatures)
+            anthropic_to_gemini::response_to_anthropic(&resp_body, model_name, &state.signatures).await
         }
 
         Publisher::Anthropic => {

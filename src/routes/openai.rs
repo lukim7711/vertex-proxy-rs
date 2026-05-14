@@ -32,7 +32,7 @@ pub async fn chat_completions(
         .and_then(|m| m.as_str())
         .unwrap_or(&state.config.default_model);
 
-    let resolved = resolve_model(&state.config, model_name).map_err(|e| {
+    let resolved = resolve_model(&state.config, &state.dynamic_models, model_name).await.map_err(|e| {
         (StatusCode::BAD_REQUEST, Json(json!({"error": {"message": e, "type": "invalid_request_error"}})))
     })?;
 

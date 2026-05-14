@@ -2,6 +2,8 @@ use axum::response::sse::Event;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::SignatureCache;
+
 /// State machine for transforming Gemini SSE streaming chunks
 /// into Anthropic SSE streaming events.
 ///
@@ -13,6 +15,7 @@ use uuid::Uuid;
 /// - Whether a text content block is currently open
 /// - The current block index for multi-block responses
 /// - Tool use detection for proper `stop_reason`
+/// - Thought signatures for both functionCall AND text parts
 pub struct GeminiStreamState {
     model: String,
     msg_id: String,
@@ -24,10 +27,11 @@ pub struct GeminiStreamState {
     started: bool,
     finished: bool,
     /// Accumulated thought_signature values from functionCall parts.
-    /// These need to be preserved in the Anthropic tool_use blocks so that
-    /// when the client sends back tool_result, we can include them in the
-    /// Gemini functionResponse parts.
-    thought_signatures: Vec<(String, Value)>, // (tool_id, signature)
+    /// (tool_id, signature)
+    tool_thought_signatures: Vec<(String, Value)>,
+    /// Accumulated thought_signature values from text parts.
+    /// (text_hash, signature)
+    text_thought_signatures: Vec<(String, Value)>,
 }
 
 impl GeminiStreamState {
@@ -42,7 +46,8 @@ impl GeminiStreamState {
             output_tokens: 0,
             started: false,
             finished: false,
-            thought_signatures: Vec::new(),
+            tool_thought_signatures: Vec::new(),
+            text_thought_signatures: Vec::new(),
         }
     }
 
@@ -88,13 +93,14 @@ impl GeminiStreamState {
                     if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
                         for part in parts {
                             // Thought content — skip in output but preserve signature for round-trip
-                            // Gemini thinking models emit thought parts with thought_signature.
-                            // These are internal reasoning that should not be shown to the user,
-                            // but the thought_signature must be preserved for the next request.
                             if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
-                                // Skip thought text from being sent to client
                                 continue;
                             }
+
+                            // Read thoughtSignature from Gemini part
+                            let thought_sig = part.get("thoughtSignature")
+                                .or_else(|| part.get("thought_signature"))
+                                .cloned();
 
                             // Text content (non-thought)
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
@@ -104,6 +110,12 @@ impl GeminiStreamState {
                                         self.text_block_open = true;
                                     }
                                     events.push(self.text_delta(text));
+
+                                    // FIX BUG 4: Store text part signature for round-trip
+                                    if let Some(ref sig) = thought_sig {
+                                        let text_hash = SignatureCache::hash_text(text);
+                                        self.text_thought_signatures.push((text_hash, sig.clone()));
+                                    }
                                 }
                             }
 
@@ -127,12 +139,7 @@ impl GeminiStreamState {
                                 let input_str = serde_json::to_string(input).unwrap_or_default();
 
                                 // Preserve thoughtSignature for round-trip
-                                // Gemini uses camelCase: thoughtSignature
-                                let sig = part.get("thoughtSignature")
-                                    .or_else(|| part.get("thought_signature"))
-                                    .cloned();
-
-                                events.push(self.open_tool_block(&tool_id, name, sig.as_ref()));
+                                events.push(self.open_tool_block(&tool_id, name, thought_sig.as_ref()));
 
                                 // Stream input JSON incrementally
                                 for chunk in input_str.as_bytes().chunks(64) {
@@ -143,9 +150,9 @@ impl GeminiStreamState {
                                 events.push(self.close_block());
                                 self.has_tool_use = true;
 
-                                // Store signature for later retrieval if needed
-                                if let Some(sig_val) = sig {
-                                    self.thought_signatures.push((tool_id, sig_val));
+                                // Store signature for later cache storage
+                                if let Some(sig_val) = thought_sig {
+                                    self.tool_thought_signatures.push((tool_id, sig_val));
                                 }
                             }
                         }
@@ -162,10 +169,14 @@ impl GeminiStreamState {
         events
     }
 
-    /// Take the accumulated thought signatures, clearing them from this state.
-    /// Returns (tool_id, signature) pairs for storage in the server-side cache.
-    pub fn take_thought_signatures(&mut self) -> Vec<(String, Value)> {
-        std::mem::take(&mut self.thought_signatures)
+    /// Take the accumulated tool thought signatures, clearing them from this state.
+    pub fn take_tool_thought_signatures(&mut self) -> Vec<(String, Value)> {
+        std::mem::take(&mut self.tool_thought_signatures)
+    }
+
+    /// Take the accumulated text thought signatures, clearing them from this state.
+    pub fn take_text_thought_signatures(&mut self) -> Vec<(String, Value)> {
+        std::mem::take(&mut self.text_thought_signatures)
     }
 
     /// Generate finish events: close any open block, then message_delta + message_stop.

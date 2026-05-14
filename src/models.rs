@@ -1,6 +1,6 @@
-use crate::config::Config;
+use crate::config::{Config, ModelConfig};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Publisher {
     Google,
     OpenApi,
@@ -16,29 +16,132 @@ impl Publisher {
             other => Err(format!("Unknown publisher: {other}. Expected: google, openapi, anthropic")),
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Publisher::Google => "google",
+            Publisher::OpenApi => "openapi",
+            Publisher::Anthropic => "anthropic",
+        }
+    }
 }
 
+#[derive(Debug, Clone)]
 pub struct ResolvedModel {
     pub vertex_name: String,
     pub publisher: Publisher,
     pub region: String,
+    /// Whether this model was auto-resolved from name pattern (not in config)
+    pub auto_resolved: bool,
 }
 
-pub fn resolve_model(config: &Config, model_name: &str) -> Result<ResolvedModel, String> {
-    let m = config
-        .find_model(model_name)
-        .ok_or_else(|| {
-            let available: Vec<&str> = config.models.iter().map(|m| m.name.as_str()).collect();
-            format!("Unknown model: {model_name}. Available: {available:?}")
-        })?;
+/// Resolution source: where the model config came from
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelSource {
+    /// From static config.yaml
+    Config,
+    /// Added at runtime via admin API
+    Dynamic,
+    /// Auto-resolved from model name pattern
+    AutoResolved,
+}
 
-    let publisher = Publisher::parse(&m.publisher)?;
+/// Resolve a model by name, checking: config → dynamic models → auto-resolve
+pub async fn resolve_model(
+    config: &Config,
+    dynamic_models: &tokio::sync::RwLock<Vec<ModelConfig>>,
+    model_name: &str,
+) -> Result<ResolvedModel, String> {
+    // 1. Check static config first
+    if let Some(m) = config.find_model(model_name) {
+        let publisher = Publisher::parse(&m.publisher)?;
+        return Ok(ResolvedModel {
+            vertex_name: m.vertex_name.clone(),
+            publisher,
+            region: m.region.clone(),
+            auto_resolved: false,
+        });
+    }
+
+    // 2. Check dynamic (runtime-added) models
+    {
+        let dyn_models = dynamic_models.read().await;
+        if let Some(m) = dyn_models.iter().find(|m| m.name == model_name) {
+            let publisher = Publisher::parse(&m.publisher)?;
+            return Ok(ResolvedModel {
+                vertex_name: m.vertex_name.clone(),
+                publisher,
+                region: m.region.clone(),
+                auto_resolved: false,
+            });
+        }
+    }
+
+    // 3. Auto-resolve from model name pattern
+    auto_resolve_model(model_name)
+}
+
+/// Auto-resolve a model based on naming conventions.
+/// This allows using any Vertex AI model without explicit config entry.
+///
+/// Pattern rules:
+/// - `gemini-*`         → Google publisher, us-central1
+/// - `claude-*`         → Anthropic publisher, us-central1
+/// - `xai/*`            → OpenAPI publisher, global
+/// - `zai-org/*`        → OpenAPI publisher, global
+/// - `*/*` (other)      → OpenAPI publisher, global (partner models)
+pub fn auto_resolve_model(model_name: &str) -> Result<ResolvedModel, String> {
+    let (publisher, region) = if model_name.starts_with("gemini-") {
+        (Publisher::Google, "us-central1".to_string())
+    } else if model_name.starts_with("claude-") {
+        (Publisher::Anthropic, "us-central1".to_string())
+    } else if model_name.starts_with("veo-") {
+        // VEO video generation models
+        (Publisher::Google, "us-central1".to_string())
+    } else if model_name.contains('/') {
+        // Partner models with publisher/name format (e.g., xai/grok-4, zai-org/glm-5)
+        (Publisher::OpenApi, "global".to_string())
+    } else {
+        return Err(format!(
+            "Unknown model: '{model_name}'. Not found in config and cannot auto-resolve. \
+             Auto-resolve patterns: gemini-* → Google, veo-* → Google (VEO), claude-* → Anthropic, */* → OpenAPI. \
+             Add it to config.yaml or via POST /admin/models"
+        ));
+    };
+
+    tracing::info!(
+        model = model_name,
+        publisher = publisher.as_str(),
+        region = %region,
+        "Auto-resolved model from name pattern"
+    );
 
     Ok(ResolvedModel {
-        vertex_name: m.vertex_name.clone(),
+        vertex_name: model_name.to_string(),
         publisher,
-        region: m.region.clone(),
+        region,
+        auto_resolved: true,
     })
+}
+
+/// Collect all known models: static config + dynamic, with source info
+pub async fn collect_all_models(
+    config: &Config,
+    dynamic_models: &tokio::sync::RwLock<Vec<ModelConfig>>,
+) -> Vec<(ModelConfig, ModelSource)> {
+    let mut result: Vec<(ModelConfig, ModelSource)> = config
+        .models
+        .iter()
+        .cloned()
+        .map(|m| (m, ModelSource::Config))
+        .collect();
+
+    let dyn_models = dynamic_models.read().await;
+    for m in dyn_models.iter() {
+        result.push((m.clone(), ModelSource::Dynamic));
+    }
+
+    result
 }
 
 /// Build the Vertex AI URL for non-streaming requests.
@@ -99,4 +202,20 @@ fn vertex_base_url(region: &str) -> String {
     } else {
         format!("https://{region}-aiplatform.googleapis.com/v1")
     }
+}
+
+// =============================================================================
+// VEO Video Generation URL Builders
+// =============================================================================
+
+/// Build the Vertex AI URL for VEO predictLongRunning (submit video generation job)
+pub fn build_veo_predict_url(project_id: &str, region: &str, model: &str) -> String {
+    let base = vertex_base_url(region);
+    format!("{base}/projects/{project_id}/locations/{region}/publishers/google/models/{model}:predictLongRunning")
+}
+
+/// Build the Vertex AI URL for VEO fetchPredictOperation (poll for result)
+pub fn build_veo_fetch_url(project_id: &str, region: &str, model: &str) -> String {
+    let base = vertex_base_url(region);
+    format!("{base}/projects/{project_id}/locations/{region}/publishers/google/models/{model}:fetchPredictOperation")
 }

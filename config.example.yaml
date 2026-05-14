@@ -4,6 +4,16 @@
 # 1. Copy file ini ke config.yaml:  cp config.example.yaml config.yaml
 # 2. Ganti master_key dengan key pilihan Anda sendiri
 # 3. Sesuaikan daftar model sesuai kebutuhan
+#
+# CATATAN: Model yang TIDAK ada di daftar ini akan otomatis di-resolve
+# berdasarkan pola nama:
+#   gemini-*  → Google publisher, us-central1
+#   veo-*     → Google publisher (VEO video), us-central1
+#   claude-*  → Anthropic publisher, us-central1
+#   */*       → OpenAPI publisher, global (partner models)
+#
+# Jadi Anda bisa menggunakan model apapun tanpa mendaftarkannya di sini.
+# Daftar di bawah berfungsi sebagai override (region berbeda, alias, dll).
 # =============================================================================
 
 # API key untuk mengakses proxy ini (wajib diisi)
@@ -13,20 +23,24 @@ master_key: "sk-your-secret-key-here"
 default_model: "gemini-2.5-flash"
 
 # =============================================================================
-# Daftar Model
+# Daftar Model (Explicit Configuration)
 # =============================================================================
 # Setiap model punya 4 field:
-#   name        → Nama yang digunakan client (bebas)
+#   name        → Nama yang digunakan client (bebas, bisa di-alias)
 #   vertex_name → Nama model di Vertex AI (harus sesuai GCP)
 #   publisher   → Jenis publisher di Vertex AI:
-#                    google   → Gemini (publishers/google/models/...)
-#                    openapi  → Grok, GLM, dll (endpoints/openapi/...)
-#                    anthropic→ Claude (publishers/anthropic/models/...)
+#                    google    → Gemini (publishers/google/models/...)
+#                    openapi   → Grok, GLM, Mistral, dll (endpoints/openapi/...)
+#                    anthropic → Claude (publishers/anthropic/models/...)
 #   region      → Region Vertex AI (global / us-central1 / dll)
 # =============================================================================
 
 models:
-  # --- Gemini (Google) ---
+  # ===========================================================================
+  # Google Gemini — Latest & Preview Models
+  # ===========================================================================
+
+  # --- Gemini 3.1 (Preview) — Terbaru, reasoning paling kuat ---
   - name: "gemini-3.1-pro-preview"
     vertex_name: "gemini-3.1-pro-preview"
     publisher: "google"
@@ -37,6 +51,28 @@ models:
     publisher: "google"
     region: "global"
 
+  - name: "gemini-3.1-flash-image"
+    vertex_name: "gemini-3.1-flash-image"
+    publisher: "google"
+    region: "global"
+
+  # --- Gemini 3 (Stable/Preview) ---
+  - name: "gemini-3-pro"
+    vertex_name: "gemini-3-pro"
+    publisher: "google"
+    region: "us-central1"
+
+  - name: "gemini-3-flash"
+    vertex_name: "gemini-3-flash"
+    publisher: "google"
+    region: "us-central1"
+
+  - name: "gemini-3-flash-image"
+    vertex_name: "gemini-3-flash-image"
+    publisher: "google"
+    region: "us-central1"
+
+  # --- Gemini 2.5 (Generally Available) ---
   - name: "gemini-2.5-pro"
     vertex_name: "gemini-2.5-pro"
     publisher: "google"
@@ -47,19 +83,234 @@ models:
     publisher: "google"
     region: "us-central1"
 
-  # --- Grok (xAI) via OpenAI endpoint ---
+  - name: "gemini-2.5-flash-image"
+    vertex_name: "gemini-2.5-flash-image"
+    publisher: "google"
+    region: "us-central1"
+
+  - name: "gemini-2.5-flash-lite"
+    vertex_name: "gemini-2.5-flash-lite"
+    publisher: "google"
+    region: "us-central1"
+
+  # --- Gemini 2.0 Flash (Stable) ---
+  - name: "gemini-2.0-flash"
+    vertex_name: "gemini-2.0-flash"
+    publisher: "google"
+    region: "us-central1"
+
+  - name: "gemini-2.0-flash-lite"
+    vertex_name: "gemini-2.0-flash-lite"
+    publisher: "google"
+    region: "us-central1"
+
+  # ===========================================================================
+  # xAI Grok — Partner Models (OpenAPI endpoint)
+  # ===========================================================================
+
   - name: "xai/grok-4.20-reasoning"
     vertex_name: "xai/grok-4.20-reasoning"
     publisher: "openapi"
     region: "global"
 
-  - name: "xai/grok-4.1-fast-reasoning"
-    vertex_name: "xai/grok-4.1-fast-reasoning"
+  - name: "xai/grok-4.1-fast"
+    vertex_name: "xai/grok-4.1-fast"
     publisher: "openapi"
     region: "global"
 
-  # --- GLM (Zhipu AI) via OpenAI endpoint ---
+  # ===========================================================================
+  # Zhipu AI GLM — Partner Models (OpenAPI endpoint)
+  # ===========================================================================
+
   - name: "zai-org/glm-5-maas"
     vertex_name: "zai-org/glm-5-maas"
     publisher: "openapi"
     region: "global"
+
+  - name: "zai-org/glm-4.7-maas"
+    vertex_name: "zai-org/glm-4.7-maas"
+    publisher: "openapi"
+    region: "global"
+
+  # ===========================================================================
+  # Anthropic Claude — Partner Models (rawPredict endpoint)
+  # ===========================================================================
+
+  - name: "claude-opus-4-7"
+    vertex_name: "claude-opus-4-7"
+    publisher: "anthropic"
+    region: "us-central1"
+
+  - name: "claude-sonnet-4-6"
+    vertex_name: "claude-sonnet-4-6"
+    publisher: "anthropic"
+    region: "us-central1"
+
+  - name: "claude-opus-4-6"
+    vertex_name: "claude-opus-4-6"
+    publisher: "anthropic"
+    region: "us-central1"
+
+  - name: "claude-opus-4-5"
+    vertex_name: "claude-opus-4-5"
+    publisher: "anthropic"
+    region: "us-central1"
+
+  - name: "claude-sonnet-4-5"
+    vertex_name: "claude-sonnet-4-5"
+    publisher: "anthropic"
+    region: "us-central1"
+
+  - name: "claude-haiku-4-5"
+    vertex_name: "claude-haiku-4-5"
+    publisher: "anthropic"
+    region: "us-central1"
+
+  - name: "claude-opus-4"
+    vertex_name: "claude-opus-4"
+    publisher: "anthropic"
+    region: "us-central1"
+
+  - name: "claude-sonnet-4"
+    vertex_name: "claude-sonnet-4"
+    publisher: "anthropic"
+    region: "us-central1"
+
+  # ===========================================================================
+  # Mistral AI — Partner Models (OpenAPI endpoint)
+  # ===========================================================================
+
+  - name: "mistral/mistral-medium-3"
+    vertex_name: "mistral/mistral-medium-3"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "mistral/mistral-small-3.1"
+    vertex_name: "mistral/mistral-small-3.1"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "mistral/codestral-2"
+    vertex_name: "mistral/codestral-2"
+    publisher: "openapi"
+    region: "global"
+
+  # ===========================================================================
+  # Meta Llama — Partner Models (OpenAPI endpoint)
+  # ===========================================================================
+
+  - name: "meta/llama-4-maverick"
+    vertex_name: "meta/llama-4-maverick"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "meta/llama-4-scout"
+    vertex_name: "meta/llama-4-scout"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "meta/llama-3.3"
+    vertex_name: "meta/llama-3.3"
+    publisher: "openapi"
+    region: "global"
+
+  # ===========================================================================
+  # DeepSeek — Partner Models (OpenAPI endpoint)
+  # ===========================================================================
+
+  - name: "deepseek/deepseek-v3.2"
+    vertex_name: "deepseek/deepseek-v3.2"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "deepseek/deepseek-v3.1"
+    vertex_name: "deepseek/deepseek-v3.1"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "deepseek/deepseek-r1-0528"
+    vertex_name: "deepseek/deepseek-r1-0528"
+    publisher: "openapi"
+    region: "global"
+
+  # ===========================================================================
+  # Qwen — Partner Models (OpenAPI endpoint)
+  # ===========================================================================
+
+  - name: "qwen/qwen3-next-instruct-80b"
+    vertex_name: "qwen/qwen3-next-instruct-80b"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "qwen/qwen3-next-thinking-80b"
+    vertex_name: "qwen/qwen3-next-thinking-80b"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "qwen/qwen3-coder"
+    vertex_name: "qwen/qwen3-coder"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "qwen/qwen3-235b"
+    vertex_name: "qwen/qwen3-235b"
+    publisher: "openapi"
+    region: "global"
+
+  # ===========================================================================
+  # Other Partner Models (OpenAPI endpoint)
+  # ===========================================================================
+
+  - name: "minimax/minimax-m2"
+    vertex_name: "minimax/minimax-m2"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "kimi/kimi-k2-thinking"
+    vertex_name: "kimi/kimi-k2-thinking"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "openai/gpt-oss-120b"
+    vertex_name: "openai/gpt-oss-120b"
+    publisher: "openapi"
+    region: "global"
+
+  - name: "openai/gpt-oss-20b"
+    vertex_name: "openai/gpt-oss-20b"
+    publisher: "openapi"
+    region: "global"
+
+  # ===========================================================================
+  # Google VEO — Video Generation Models (predictLongRunning API)
+  # ===========================================================================
+  # VEO models menggunakan API async yang berbeda dari LLM models.
+  # Endpoint: POST /v1/veo/generate (submit job)
+  #           POST /v1/veo/result  (poll result)
+  #           POST /v1/veo/generate-sync (submit + auto-poll)
+  # ===========================================================================
+
+  - name: "veo-3.1-fast-generate-001"
+    vertex_name: "veo-3.1-fast-generate-001"
+    publisher: "google"
+    region: "us-central1"
+
+  - name: "veo-3.1-generate-001"
+    vertex_name: "veo-3.1-generate-001"
+    publisher: "google"
+    region: "us-central1"
+
+  - name: "veo-3.1-lite-generate-001"
+    vertex_name: "veo-3.1-lite-generate-001"
+    publisher: "google"
+    region: "us-central1"
+
+  - name: "veo-3-generate-001"
+    vertex_name: "veo-3-generate-001"
+    publisher: "google"
+    region: "us-central1"
+
+  - name: "veo-2-generate-001"
+    vertex_name: "veo-2-generate-001"
+    publisher: "google"
+    region: "us-central1"

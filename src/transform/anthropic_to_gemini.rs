@@ -53,8 +53,8 @@ pub fn extract_system_text(system: Option<&Value>) -> Option<String> {
 /// (Gemini requires strict user/model alternation).
 ///
 /// Uses SignatureCache to retrieve thought signatures that were stored
-/// when the proxy received Gemini responses. Claude Code doesn't preserve
-/// custom fields, so we must look up signatures server-side.
+/// when the proxy received Gemini responses. Also checks inline
+/// `_thought_signature` fields as fallback.
 pub async fn messages_to_gemini(messages: &[Value], signatures: &SignatureCache) -> Vec<Value> {
     // First pass: build tool name registry from assistant messages
     // so we can map tool_use_id → tool name for functionResponse
@@ -91,8 +91,6 @@ pub async fn messages_to_gemini(messages: &[Value], signatures: &SignatureCache)
 
         // Gemini requires strict role alternation.
         // If the last message has the same role, merge parts into it.
-        // IMPORTANT: Don't merge parts that both have thoughtSignature
-        // (signatures cannot be merged per GCP docs).
         if let Some(last) = contents.last_mut() {
             if last.get("role").and_then(|r| r.as_str()) == Some(gemini_role) {
                 if let Some(existing_parts) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
@@ -114,7 +112,15 @@ async fn content_to_gemini_parts(
     signatures: &SignatureCache,
 ) -> Vec<Value> {
     match content {
-        Some(Value::String(text)) => vec![json!({"text": text})],
+        Some(Value::String(text)) => {
+            let mut part = json!({"text": text});
+            // Look up text signature from cache
+            let text_hash = SignatureCache::hash_text(text);
+            if let Some(sig) = signatures.get_text_signature(&text_hash).await {
+                part["thoughtSignature"] = sig;
+            }
+            vec![part]
+        }
         Some(Value::Array(blocks)) => {
             let mut parts: Vec<Value> = Vec::new();
             for block in blocks {
@@ -122,7 +128,13 @@ async fn content_to_gemini_parts(
                     Some("text") => {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                             if !text.is_empty() {
-                                parts.push(json!({"text": text}));
+                                let mut part = json!({"text": text});
+                                // Look up text signature from cache (thinking models require this)
+                                let text_hash = SignatureCache::hash_text(text);
+                                if let Some(sig) = signatures.get_text_signature(&text_hash).await {
+                                    part["thoughtSignature"] = sig;
+                                }
+                                parts.push(part);
                             }
                         }
                     }
@@ -133,7 +145,7 @@ async fn content_to_gemini_parts(
                         let mut part = json!({
                             "functionCall": {"name": name, "args": input}
                         });
-                        // Look up thoughtSignature from server-side cache
+                        // Look up thoughtSignature from server-side cache (primary)
                         if let Some(sig) = signatures.get_tool_signature(tool_id).await {
                             part["thoughtSignature"] = sig;
                         }
@@ -170,9 +182,13 @@ async fn content_to_gemini_parts(
                                 "response": {"content": response_text}
                             }
                         });
-                        // Look up thoughtSignature from server-side cache
+                        // Look up thoughtSignature from server-side cache (primary)
                         if let Some(sig) = signatures.get_tool_signature(tool_use_id).await {
                             part["thoughtSignature"] = sig;
+                        }
+                        // FIX BUG 6: Also check inline _thought_signature (fallback)
+                        else if let Some(sig) = block.get("_thought_signature") {
+                            part["thoughtSignature"] = sig.clone();
                         }
                         parts.push(part);
                     }
@@ -211,7 +227,11 @@ fn extract_tool_result_text(content: Option<&Value>) -> String {
 
 /// Gemini API response → Anthropic format.
 /// Also stores thought signatures in the server-side cache for round-trip.
-pub fn response_to_anthropic(response: &Value, model: &str, signatures: &SignatureCache) -> Value {
+///
+/// FIX BUG 1: Now includes `_thought_signature` in tool_use blocks.
+/// FIX BUG 2: Now stores signatures synchronously (no tokio::spawn).
+/// FIX BUG 4: Now stores text part signatures too.
+pub async fn response_to_anthropic(response: &Value, model: &str, signatures: &SignatureCache) -> Value {
     let msg_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
 
     let candidates = response.get("candidates").and_then(|c| c.as_array());
@@ -220,6 +240,10 @@ pub fn response_to_anthropic(response: &Value, model: &str, signatures: &Signatu
     let mut finish_reason = "end_turn";
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
+
+    // Collect signatures for batch storage
+    let mut tool_sigs_to_store: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut text_sigs_to_store: Vec<(String, serde_json::Value)> = Vec::new();
 
     if let Some(candidates) = candidates {
         if let Some(first) = candidates.first() {
@@ -246,38 +270,51 @@ pub fn response_to_anthropic(response: &Value, model: &str, signatures: &Signatu
                     if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
                         continue;
                     }
+
+                    // Read thoughtSignature from Gemini response (camelCase primary, snake_case fallback)
+                    let thought_sig = part.get("thoughtSignature")
+                        .or_else(|| part.get("thought_signature"))
+                        .cloned();
+
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                         if !text.is_empty() {
+                            // FIX BUG 4: Store text part signature for round-trip
+                            if let Some(ref sig) = thought_sig {
+                                let text_hash = SignatureCache::hash_text(text);
+                                text_sigs_to_store.push((text_hash, sig.clone()));
+                            }
                             content_blocks.push(json!({"type": "text", "text": text}));
                         }
                     }
                     if let Some(fc) = part.get("functionCall") {
                         has_tool_use = true;
                         let tool_id = format!("toolu_{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
-                        let tool_block = json!({
+
+                        // FIX BUG 1: Include _thought_signature in the tool_use block
+                        let mut tool_block = json!({
                             "type": "tool_use",
                             "id": tool_id.clone(),
                             "name": fc.get("name").and_then(|n| n.as_str()).unwrap_or(""),
                             "input": fc.get("args").unwrap_or(&Value::Null),
                         });
-                        // Store thoughtSignature in server-side cache for round-trip
-                        // Gemini uses camelCase: thoughtSignature
-                        if let Some(sig) = part.get("thoughtSignature")
-                            .or_else(|| part.get("thought_signature"))
-                        {
-                            // Store in cache (spawn since it's async)
-                            let sig_cache = signatures.clone();
-                            let tid = tool_id.clone();
-                            let sig_val = sig.clone();
-                            tokio::spawn(async move {
-                                sig_cache.store_tool_signature(tid, sig_val).await;
-                            });
+
+                        if let Some(sig) = thought_sig {
+                            tool_block["_thought_signature"] = sig.clone();
+                            // FIX BUG 2: Collect for synchronous batch storage (no tokio::spawn)
+                            tool_sigs_to_store.push((tool_id.clone(), sig));
                         }
+
                         content_blocks.push(tool_block);
                     }
                 }
             }
         }
+    }
+
+    // FIX BUG 2: Store signatures synchronously (batch write)
+    if !tool_sigs_to_store.is_empty() || !text_sigs_to_store.is_empty() {
+        signatures.store_tool_signatures_batch(tool_sigs_to_store).await;
+        signatures.store_text_signatures_batch(text_sigs_to_store).await;
     }
 
     // Gemini returns STOP even when there are function calls.
