@@ -3,22 +3,40 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 
 use crate::config::Config;
-use crate::models::{build_vertex_url, resolve_model, Publisher};
-use crate::transform::{anthropic_to_gemini, anthropic_to_openai};
+use crate::models::{build_vertex_streaming_url, build_vertex_url, resolve_model, Publisher};
+use crate::transform::{
+    anthropic_to_gemini, anthropic_to_openai, gemini_stream::GeminiStreamState,
+    openai_stream::OpenAiStreamState, sse_parser::SseParser,
+};
 use crate::AppState;
+
+// ---------------------------------------------------------------------------
+// Fake streaming — wraps a complete response into SSE events (fallback)
+// ---------------------------------------------------------------------------
 
 /// Wrap a complete Anthropic response into SSE stream events.
 ///
 /// This "fakes" streaming by chunking a complete response into SSE events
-/// that match the Anthropic streaming protocol. Claude Code requires this format.
+/// that match the Anthropic streaming protocol. Used as fallback when
+/// real streaming is not available (e.g., Anthropic passthrough publisher).
 fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let msg_id = response["id"].as_str().unwrap_or("msg_unknown").to_string();
-    let model = response["model"].as_str().unwrap_or("unknown").to_string();
-    let stop_reason = response["stop_reason"].as_str().unwrap_or("end_turn").to_string();
+    let msg_id = response["id"]
+        .as_str()
+        .unwrap_or("msg_unknown")
+        .to_string();
+    let model = response["model"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let stop_reason = response["stop_reason"]
+        .as_str()
+        .unwrap_or("end_turn")
+        .to_string();
 
     let mut events: Vec<Result<Event, Infallible>> = vec![Ok(Event::default()
         .event("message_start")
@@ -54,7 +72,6 @@ fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Ev
                         .to_string(),
                     )));
                     if !text.is_empty() {
-                        // Stream text in reasonable chunks for incremental display
                         for chunk in text.as_bytes().chunks(256) {
                             let partial = String::from_utf8_lossy(chunk).to_string();
                             events.push(Ok(Event::default().event("content_block_delta").data(
@@ -72,8 +89,14 @@ fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Ev
                     )));
                 }
                 Some("tool_use") => {
-                    let tool_id = block["id"].as_str().unwrap_or("toolu_unknown").to_string();
-                    let tool_name = block["name"].as_str().unwrap_or("unknown").to_string();
+                    let tool_id = block["id"]
+                        .as_str()
+                        .unwrap_or("toolu_unknown")
+                        .to_string();
+                    let tool_name = block["name"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string();
                     events.push(Ok(Event::default().event("content_block_start").data(
                         json!({
                             "type": "content_block_start",
@@ -87,7 +110,6 @@ fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Ev
                         })
                         .to_string(),
                     )));
-                    // Stream input JSON incrementally in small chunks
                     let input_str = serde_json::to_string(&block["input"]).unwrap_or_default();
                     for chunk in input_str.as_bytes().chunks(64) {
                         let partial = String::from_utf8_lossy(chunk).to_string();
@@ -126,6 +148,151 @@ fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Ev
     Sse::new(futures::stream::iter(events))
 }
 
+// ---------------------------------------------------------------------------
+// Real streaming — reads SSE from Vertex AI and transforms on-the-fly
+// ---------------------------------------------------------------------------
+
+/// Receiver-to-Stream adapter for tokio::sync::mpsc::Receiver.
+/// This avoids adding tokio-stream as a dependency.
+struct ReceiverStream<T> {
+    rx: tokio::sync::mpsc::Receiver<T>,
+}
+
+impl<T> futures::Stream for ReceiverStream<T> {
+    type Item = T;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+/// Stream Gemini SSE chunks from Vertex AI and transform to Anthropic SSE on-the-fly.
+fn stream_gemini(
+    response: reqwest::Response,
+    model: String,
+) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+
+    tokio::spawn(async move {
+        let mut parser = SseParser::new();
+        let mut state = GeminiStreamState::new(model);
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(bytes) => {
+                    let data_events = parser.push_bytes(&bytes);
+                    for data in data_events {
+                        // Parse JSON
+                        let chunk: Value = match serde_json::from_str(&data) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("Failed to parse Gemini streaming chunk: {e}");
+                                continue;
+                            }
+                        };
+
+                        // Transform to Anthropic SSE events
+                        let events = state.process_chunk(&chunk);
+                        for event in events {
+                            if tx.send(Ok(event)).await.is_err() {
+                                // Client disconnected
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Gemini streaming error: {e}");
+                    // Send finish events to gracefully close the stream
+                    let finish_events = state.finish(None);
+                    for event in finish_events {
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Stream ended — if we haven't sent finish events yet, send them now
+        let finish_events = state.finish(None);
+        for event in finish_events {
+            if tx.send(Ok(event)).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    Sse::new(ReceiverStream { rx })
+}
+
+/// Stream OpenAI SSE chunks from Vertex AI and transform to Anthropic SSE on-the-fly.
+fn stream_openai(
+    response: reqwest::Response,
+    model: String,
+) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+
+    tokio::spawn(async move {
+        let mut parser = SseParser::new();
+        let mut state = OpenAiStreamState::new(model);
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(bytes) => {
+                    let data_events = parser.push_bytes(&bytes);
+                    for data in data_events {
+                        let chunk: Value = match serde_json::from_str(&data) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("Failed to parse OpenAI streaming chunk: {e}");
+                                continue;
+                            }
+                        };
+
+                        let events = state.process_chunk(&chunk);
+                        for event in events {
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("OpenAI streaming error: {e}");
+                    let finish_events = state.finish(None);
+                    for event in finish_events {
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Stream ended without explicit finish — close gracefully
+        let finish_events = state.finish(None);
+        for event in finish_events {
+            if tx.send(Ok(event)).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    Sse::new(ReceiverStream { rx })
+}
+
+// ---------------------------------------------------------------------------
+// Main handler
+// ---------------------------------------------------------------------------
+
 pub async fn messages(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -154,13 +321,6 @@ pub async fn messages(
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e})))
     })?;
 
-    let url = build_vertex_url(
-        &project_id,
-        &resolved.region,
-        &resolved.publisher,
-        &resolved.vertex_name,
-    );
-
     let max_tokens = body
         .get("max_tokens")
         .and_then(|t| t.as_u64())
@@ -175,6 +335,162 @@ pub async fn messages(
                 Json(json!({"error": "messages field is required"})),
             )
         })?;
+
+    // =======================================================================
+    // REAL STREAMING PATH — Gemini and OpenAPI publishers
+    // =======================================================================
+    if is_streaming && matches!(resolved.publisher, Publisher::Google | Publisher::OpenApi) {
+        let url = build_vertex_streaming_url(
+            &project_id,
+            &resolved.region,
+            &resolved.publisher,
+            &resolved.vertex_name,
+        );
+
+        match resolved.publisher {
+            Publisher::Google => {
+                let tools = body
+                    .get("tools")
+                    .and_then(|t| t.as_array())
+                    .map(|t| t.as_slice())
+                    .unwrap_or(&[]);
+
+                let gemini_contents = anthropic_to_gemini::messages_to_gemini(messages);
+
+                let mut gemini_body = json!({
+                    "contents": gemini_contents,
+                    "generationConfig": {"maxOutputTokens": max_tokens},
+                });
+
+                if let Some(sys_text) = anthropic_to_gemini::extract_system_text(system) {
+                    gemini_body["systemInstruction"] =
+                        json!({"parts": [{"text": sys_text}]});
+                }
+
+                if !tools.is_empty() {
+                    gemini_body["tools"] =
+                        json!(anthropic_to_gemini::tools_to_gemini(tools));
+                }
+
+                tracing::debug!("Gemini streaming request to {url}");
+                let resp = state
+                    .client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .json(&gemini_body)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("Vertex AI streaming request failed: {e}");
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            Json(json!({"error": format!("Upstream request failed: {e}")})),
+                        )
+                    })?;
+
+                let status = resp.status();
+                if !status.is_success() {
+                    // Error response is not SSE — parse as regular JSON
+                    let status_code =
+                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                    let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
+                    let error_msg = resp_body
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .or_else(|| {
+                            resp_body
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                        })
+                        .unwrap_or("Unknown upstream error");
+                    tracing::error!("Vertex AI streaming error {status}: {error_msg}");
+                    return Err((
+                        status_code,
+                        Json(json!({"error": {"type": "upstream_error", "message": error_msg}})),
+                    ));
+                }
+
+                let model_name_owned = model_name.to_string();
+                let sse = stream_gemini(resp, model_name_owned);
+                return Ok(sse.into_response());
+            }
+
+            Publisher::OpenApi => {
+                let tools = body
+                    .get("tools")
+                    .and_then(|t| t.as_array())
+                    .map(|t| t.as_slice())
+                    .unwrap_or(&[]);
+
+                let mut openai_body = json!({
+                    "model": resolved.vertex_name,
+                    "messages": anthropic_to_openai::messages_to_openai(system, messages),
+                    "max_tokens": max_tokens,
+                    "stream": true,
+                });
+
+                if !tools.is_empty() {
+                    openai_body["tools"] =
+                        json!(anthropic_to_openai::tools_to_openai(tools));
+                }
+
+                tracing::debug!("OpenAPI streaming request to {url}");
+                let resp = state
+                    .client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .json(&openai_body)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("Vertex AI streaming request failed: {e}");
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            Json(json!({"error": format!("Upstream request failed: {e}")})),
+                        )
+                    })?;
+
+                let status = resp.status();
+                if !status.is_success() {
+                    let status_code =
+                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                    let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
+                    let error_msg = resp_body
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .or_else(|| {
+                            resp_body
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                        })
+                        .unwrap_or("Unknown upstream error");
+                    tracing::error!("Vertex AI streaming error {status}: {error_msg}");
+                    return Err((
+                        status_code,
+                        Json(json!({"error": {"type": "upstream_error", "message": error_msg}})),
+                    ));
+                }
+
+                let model_name_owned = model_name.to_string();
+                let sse = stream_openai(resp, model_name_owned);
+                return Ok(sse.into_response());
+            }
+
+            _ => unreachable!(),
+        }
+    }
+
+    // =======================================================================
+    // NON-STREAMING PATH (or Anthropic passthrough with fake streaming)
+    // =======================================================================
+    let url = build_vertex_url(
+        &project_id,
+        &resolved.region,
+        &resolved.publisher,
+        &resolved.vertex_name,
+    );
 
     let result = match resolved.publisher {
         Publisher::OpenApi => {
@@ -224,7 +540,6 @@ pub async fn messages(
                 ));
             }
 
-            // Log raw upstream response for debugging model quirks
             tracing::debug!("OpenAPI raw response: {resp_body}");
 
             anthropic_to_openai::response_to_anthropic(&resp_body, model_name)
@@ -237,7 +552,6 @@ pub async fn messages(
                 .map(|t| t.as_slice())
                 .unwrap_or(&[]);
 
-            // Convert messages (system prompt handled separately via systemInstruction)
             let gemini_contents = anthropic_to_gemini::messages_to_gemini(messages);
 
             let mut gemini_body = json!({
@@ -245,7 +559,6 @@ pub async fn messages(
                 "generationConfig": {"maxOutputTokens": max_tokens},
             });
 
-            // System prompt goes into systemInstruction, NOT as a user turn
             if let Some(sys_text) = anthropic_to_gemini::extract_system_text(system) {
                 gemini_body["systemInstruction"] = json!({"parts": [{"text": sys_text}]});
             }
@@ -331,6 +644,7 @@ pub async fn messages(
     };
 
     if is_streaming {
+        // Fake streaming fallback for Anthropic passthrough
         Ok(response_to_sse(result).into_response())
     } else {
         Ok(Json(result).into_response())
