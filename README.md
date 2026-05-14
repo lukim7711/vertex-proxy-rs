@@ -1,10 +1,10 @@
 # Vertex AI Proxy (Rust)
 
-Proxy ringan yang menerjemahkan **Anthropic Messages API** dan **OpenAI Chat Completions API** ke **Google Vertex AI**, memungkinkan tools seperti Claude Code menggunakan model-model di Vertex AI (Gemini, Grok, GLM) tanpa Claude API key.
+A lightweight proxy that translates **Anthropic Messages API** and **OpenAI Chat Completions API** to **Google Vertex AI**, enabling tools like Claude Code to use models on Vertex AI (Gemini, Grok, GLM) without a Claude API key.
 
 **Binary 2.7MB | Memory ~1.4MB | Zero runtime dependencies**
 
-## Arsitektur
+## Architecture
 
 ```
 Claude Code / OpenAI Client          Proxy (Rust)                        Vertex AI
@@ -17,24 +17,24 @@ POST /v1/chat/completions ───>  OpenAI → Gemini contents           ─�
 (OpenAI API format)             OpenAI passthrough                 ──>  Grok / GLM
 ```
 
-Proxy membaca model dari request, mencocokkan dengan config, lalu merutekan ke Vertex AI endpoint yang sesuai. Tiga jalur publisher:
+The proxy reads the model from the request, matches it against the config, then routes to the appropriate Vertex AI endpoint. Three publisher paths:
 
-| Publisher | Model | Endpoint Vertex AI | Transformasi |
+| Publisher | Model | Vertex AI Endpoint | Transformation |
 |---|---|---|---|
 | `google` | Gemini | `publishers/google/models/{m}:generateContent` | Anthropic/OpenAI → Gemini |
 | `openapi` | Grok, GLM | `endpoints/openapi/chat/completions` | Anthropic → OpenAI |
 | `anthropic` | Claude | `publishers/anthropic/models/{m}:rawPredict` | Passthrough |
 
-## Fitur
+## Features
 
-- **Dual API**: Anthropic Messages API (`/v1/messages`) dan OpenAI Chat Completions API (`/v1/chat/completions`)
-- **Multi-model**: Gemini, Grok (xAI), GLM (Zhipu AI), Claude — semua lewat satu proxy
-- **Tool use**: Menerjemahkan Anthropic/OpenAI tools ke format Vertex AI dan sebaliknya
-- **Streaming (SSE)**: Response di-chunk sebagai Server-Sent Events (format Anthropic streaming)
-- **ADC Auth**: Autentikasi ke Vertex AI via GCP metadata server (Application Default Credentials)
-- **API key auth**: Melindungi proxy dengan `x-api-key` atau `Authorization: Bearer`
+- **Dual API**: Anthropic Messages API (`/v1/messages`) and OpenAI Chat Completions API (`/v1/chat/completions`)
+- **Multi-model**: Gemini, Grok (xAI), GLM (Zhipu AI), Claude — all through one proxy
+- **Tool use**: Translates Anthropic/OpenAI tools to Vertex AI format and back
+- **Streaming (SSE)**: Response chunked as Server-Sent Events (Anthropic streaming format)
+- **ADC Auth**: Authenticates to Vertex AI via GCP metadata server (Application Default Credentials)
+- **API key auth**: Protects the proxy with `x-api-key` or `Authorization: Bearer`
 
-## Model yang Didukung
+## Supported Models
 
 | Model | Publisher | Region |
 |---|---|---|
@@ -46,15 +46,15 @@ Proxy membaca model dari request, mencocokkan dengan config, lalu merutekan ke V
 | `xai/grok-4.20-reasoning` | xAI (OpenAPI) | global |
 | `zai-org/glm-5-maas` | Zhipu AI (OpenAPI) | global |
 
-Daftar model dikonfigurasi di `config.yaml` — bisa ditambah/kurangi sesuai kebutuhan.
+The model list is configured in `config.yaml` — add or remove as needed.
 
 ## Quick Start
 
-### Prasyarat
+### Prerequisites
 
 - Rust toolchain (1.75+)
-- Berjalan di GCP VM dengan Vertex AI API enabled
-- Service account dengan role `Vertex AI User`
+- Running on a GCP VM with Vertex AI API enabled
+- Service account with `Vertex AI User` role
 
 ### Build
 
@@ -62,9 +62,9 @@ Daftar model dikonfigurasi di `config.yaml` — bisa ditambah/kurangi sesuai keb
 cargo build --release
 ```
 
-Binary ada di `target/release/vertex-proxy-rs` (~2.7MB dengan LTO + strip).
+Binary at `target/release/vertex-proxy-rs` (~2.7MB with LTO + strip).
 
-### Konfigurasi
+### Configuration
 
 ```bash
 cp config.example.yaml config.yaml
@@ -83,7 +83,7 @@ models:
     region: "us-central1"
 ```
 
-### Jalankan
+### Run
 
 ```bash
 ./vertex-proxy-rs
@@ -92,13 +92,13 @@ models:
 
 Environment variables:
 - `PORT` — port (default: `8000`)
-- `CONFIG_PATH` — path ke config (default: `config.yaml`)
+- `CONFIG_PATH` — path to config (default: `config.yaml`)
 
 ## API Endpoints
 
 ### POST `/v1/messages` — Anthropic Messages API
 
-Digunakan oleh Claude Code. Mendukung streaming (`"stream": true`).
+Used by Claude Code. Supports streaming (`"stream": true`).
 
 ```bash
 curl -X POST http://localhost:8000/v1/messages \
@@ -123,7 +123,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-### GET `/v1/models` — List model
+### GET `/v1/models` — List models
 
 ```bash
 curl http://localhost:8000/v1/models
@@ -135,21 +135,21 @@ curl http://localhost:8000/v1/models
 curl http://localhost:8000/health
 ```
 
-## Autentikasi
+## Authentication
 
 ### Client → Proxy
 
-Kirim API key via salah satu:
+Send the API key via either:
 - Header `x-api-key: sk-your-secret-key`
 - Header `Authorization: Bearer sk-your-secret-key`
 
-Key divalidasi terhadap `master_key` di `config.yaml`.
+The key is validated against `master_key` in `config.yaml`.
 
 ### Proxy → Vertex AI
 
-Proxy menggunakan **GCP metadata server** untuk mendapatkan access token (Application Default Credentials). Token di-cache selama ~50 menit, auto-refresh. Tidak perlu service account key file.
+The proxy uses the **GCP metadata server** to obtain an access token (Application Default Credentials). Tokens are cached for ~50 minutes, auto-refreshed. No service account key file needed.
 
-## Deploy (systemd)
+## Deployment (systemd)
 
 ```ini
 # /etc/systemd/system/vertex-proxy-rust.service
@@ -174,7 +174,7 @@ sudo systemctl enable --now vertex-proxy-rust
 sudo systemctl status vertex-proxy-rust
 ```
 
-## Struktur Source Code
+## Source Structure
 
 ```
 src/
@@ -192,7 +192,7 @@ src/
     └── schema_clean.rs          # Strip unsupported JSON Schema keys
 ```
 
-## Cara Kerja Transformasi
+## How Transformations Work
 
 ### Publisher: `google` (Gemini)
 
@@ -210,26 +210,26 @@ src/
 
 ### Publisher: `anthropic` (Claude)
 
-- Passthrough dengan menambahkan `anthropic_version: vertex-2023-10-16`
+- Passthrough with `anthropic_version: vertex-2023-10-16`
 
 ## Performance
 
-| Metrik | Nilai |
+| Metric | Value |
 |---|---|
 | Binary size | 2.7 MB |
 | Memory (idle) | ~1.4 MB |
 | Memory (load) | ~5-8 MB |
 | Startup time | <100ms |
-| Dependencies | 0 (static linked) |
+| Runtime dependencies | 0 (static linked) |
 
-## Kredit
+## Credits
 
-Berdasarkan [OrionStarAI/claudecode-vertex-proxy](https://github.com/OrionStarAI/claudecode-vertex-proxy) (Python), ditulis ulang dalam Rust dengan:
-- ADC support (menggantikan service account key)
+Based on [OrionStarAI/claudecode-vertex-proxy](https://github.com/OrionStarAI/claudecode-vertex-proxy) (Python), rewritten in Rust with:
+- ADC support (replaces service account key)
 - Multi-publisher routing (Google, OpenAPI, Anthropic)
 - Dual API (Anthropic + OpenAI)
 - Proper SSE streaming
 
-## Lisensi
+## License
 
 MIT
