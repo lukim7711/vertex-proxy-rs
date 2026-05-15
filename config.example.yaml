@@ -23,6 +23,62 @@ master_key: "sk-your-secret-key-here"
 default_model: "gemini-2.5-flash"
 
 # =============================================================================
+# Rate Limit Configuration
+# =============================================================================
+# Mengontrol jumlah request yang diizinkan dalam periode waktu tertentu.
+#
+# PENTING UNTUK CLAUDE CODE:
+# Claude Code menggunakan banyak subagent yang menjalankan parallel requests.
+# Rate limit yang terlalu ketat akan memblokir subagent dan menyebabkan
+# task kompleks gagal. Oleh karena itu, rate limit di-DISABLE secara default.
+#
+# Jika Anda ingin mengaktifkan rate limit (misalnya untuk billing tracking),
+# set enabled: true dan sesuaikan batasannya.
+# =============================================================================
+rate_limit:
+  enabled: false                      # DISABLED by default (Claude Code friendly)
+  requests_per_minute: 300            # Global limit (hanya berlaku jika enabled=true)
+  requests_per_minute_per_key: 120    # Per API key
+  requests_per_minute_per_ip: 120     # Per IP address
+  burst_size: 50                      # Allow short bursts
+
+# =============================================================================
+# Retry Configuration
+# =============================================================================
+# Automatic retry untuk upstream errors yang bersifat transient.
+# Ini adalah SOLUSI UTAMA untuk error 401 (token expired) dan error 5xx.
+#
+# Cara kerja:
+# 1. Jika upstream mengembalikan 401, token akan di-force-refresh lalu retry
+# 2. Jika upstream mengembalikan 429/5xx, akan di-retry dengan backoff
+# 3. Exponential backoff: delay meningkat 2x setiap retry
+# 4. Jitter ditambahkan untuk mencegah thundering herd
+# =============================================================================
+retry:
+  enabled: true                       # Aktifkan retry otomatis
+  max_retries: 3                      # Maksimal 3x retry (total 4 attempts)
+  initial_delay_ms: 500               # Delay awal 500ms sebelum retry pertama
+  max_delay_ms: 10000                 # Maksimal delay 10 detik
+  backoff_multiplier: 2.0             # Delay dikali 2 setiap retry
+  retry_on_statuses:                  # Status code yang di-retry
+    - 401                             # Token expired/invalid → force refresh token
+    - 429                             # Rate limited oleh upstream
+    - 500                             # Internal server error
+    - 502                             # Bad gateway
+    - 503                             # Service unavailable
+    - 504                             # Gateway timeout
+
+# =============================================================================
+# Auth Token Management (Automatic, tidak perlu konfigurasi)
+# =============================================================================
+# Token dari GCP metadata server di-refresh secara otomatis:
+# - Background refresh: token di-refresh 10 menit sebelum expired
+# - Force refresh: jika 401 diterima, token langsung di-refresh
+# - Refresh coalescing: mencegah thundering herd saat banyak request
+# - Diagnostik: GET /admin/token-info untuk cek status token
+# =============================================================================
+
+# =============================================================================
 # Daftar Model (Explicit Configuration)
 # =============================================================================
 # Setiap model punya 4 field:

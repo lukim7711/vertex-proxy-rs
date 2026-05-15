@@ -1,14 +1,16 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::{HeaderMap, HeaderValue, StatusCode}, Json, response::IntoResponse};
 use serde_json::{json, Value};
 
 use crate::models::{build_vertex_url, resolve_model, Publisher};
+use crate::rate_limit::RateLimitScope;
+use crate::retry::{with_retry, RetryableError};
 use crate::AppState;
 
 pub async fn chat_completions(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     // Auth check
     let key = headers
         .get("Authorization")
@@ -27,6 +29,57 @@ pub async fn chat_completions(
         ));
     }
 
+    // ── Rate limiting check ──────────────────────────────────────────
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        });
+
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim());
+
+    let rl_result = state.rate_limiter.check_and_record(api_key, ip).await;
+
+    if !rl_result.allowed {
+        let retry_after = rl_result.retry_after_secs.unwrap_or(30);
+        let scope_msg = match rl_result.scope {
+            RateLimitScope::Global => "Global rate limit exceeded",
+            RateLimitScope::PerKey => "Per-key rate limit exceeded",
+            RateLimitScope::PerIp => "Per-IP rate limit exceeded",
+            RateLimitScope::None => "Rate limit exceeded",
+        };
+
+        let mut response = axum::response::Response::new(
+            serde_json::to_string(&json!({
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": format!("{}. Retry after {} seconds.", scope_msg, retry_after)
+                }
+            }))
+            .unwrap_or_default()
+            .into(),
+        );
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        response.headers_mut().insert("Retry-After", HeaderValue::from_str(&retry_after.to_string()).unwrap_or_else(|_| HeaderValue::from_static("30")));
+        response.headers_mut().insert("X-RateLimit-Limit", HeaderValue::from_str(&rl_result.limit.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+        response.headers_mut().insert("X-RateLimit-Remaining", HeaderValue::from_str(&rl_result.remaining.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+        response.headers_mut().insert("X-RateLimit-Reset", HeaderValue::from_str(&rl_result.reset_at.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+        response.headers_mut().insert("Content-Type", HeaderValue::from_static("application/json"));
+        return Ok(response);
+    }
+
+    let rl_limit = rl_result.limit;
+    let rl_remaining = rl_result.remaining;
+    let rl_reset = rl_result.reset_at;
+
     let model_name = body
         .get("model")
         .and_then(|m| m.as_str())
@@ -38,7 +91,7 @@ pub async fn chat_completions(
 
     let (token, project_id) = state.auth.get_token().await.map_err(|e| {
         tracing::error!("Auth error: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": {"message": e, "type": "server_error"}})))
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": {"message": format!("Failed to obtain auth token: {e}"), "type": "server_error"}})))
     })?;
 
     let url = build_vertex_url(
@@ -48,41 +101,61 @@ pub async fn chat_completions(
         &resolved.vertex_name,
     );
 
-    match resolved.publisher {
+    let result_json = match resolved.publisher {
         Publisher::OpenApi => {
             // Direct passthrough — already in OpenAI format
             let mut oai_body = body.clone();
             oai_body["model"] = json!(resolved.vertex_name);
 
-            let resp = state
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&oai_body)
-                .send()
-                .await
-                .map_err(|e| {
-                    (StatusCode::BAD_GATEWAY, Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})))
-                })?;
+            let retry_config = state.config.retry.clone();
+            let resp = with_retry(&state, |attempt| {
+                let url = url.clone();
+                let token = token.clone();
+                let oai_body = oai_body.clone();
+                let client = state.client.clone();
+                let retry_config = retry_config.clone();
 
-            let status = resp.status();
+                async move {
+                    let resp = client
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {token}"))
+                        .json(&oai_body)
+                        .send()
+                        .await
+                        .map_err(|e| RetryableError::transport(format!("Upstream request failed: {e}")))?;
+
+                    let status = resp.status();
+                    if status.is_success() {
+                        Ok(resp)
+                    } else {
+                        let status_code = status.as_u16();
+                        let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
+                        let error_msg = resp_body
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Unknown upstream error");
+
+                        tracing::warn!("OpenAPI upstream returned {} (attempt {}): {}", status_code, attempt, error_msg);
+
+                        Err(RetryableError::from_status(
+                            status_code,
+                            format!("{} {}", status_code, error_msg),
+                            &retry_config,
+                        ))
+                    }
+                }
+            })
+            .await
+            .map_err(|e| {
+                (StatusCode::BAD_GATEWAY, Json(json!({"error": {"message": e.message, "type": "upstream_error"}})))
+            })?;
+
             let resp_body = resp.json::<Value>().await.map_err(|e| {
                 (StatusCode::BAD_GATEWAY, Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})))
             })?;
 
-            if !status.is_success() {
-                let error_msg = resp_body
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown upstream error");
-                return Err((
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                    Json(json!({"error": {"message": error_msg, "type": "upstream_error"}})),
-                ));
-            }
-
-            Ok(Json(resp_body))
+            resp_body
         }
         Publisher::Google => {
             // Convert OpenAI messages → Gemini contents
@@ -134,33 +207,53 @@ pub async fn chat_completions(
                 gemini_body["systemInstruction"] = json!({"parts": [{"text": sys}]});
             }
 
-            let resp = state
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&gemini_body)
-                .send()
-                .await
-                .map_err(|e| {
-                    (StatusCode::BAD_GATEWAY, Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})))
-                })?;
+            let retry_config = state.config.retry.clone();
+            let resp = with_retry(&state, |attempt| {
+                let url = url.clone();
+                let token = token.clone();
+                let gemini_body = gemini_body.clone();
+                let client = state.client.clone();
+                let retry_config = retry_config.clone();
 
-            let status = resp.status();
+                async move {
+                    let resp = client
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {token}"))
+                        .json(&gemini_body)
+                        .send()
+                        .await
+                        .map_err(|e| RetryableError::transport(format!("Upstream request failed: {e}")))?;
+
+                    let status = resp.status();
+                    if status.is_success() {
+                        Ok(resp)
+                    } else {
+                        let status_code = status.as_u16();
+                        let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
+                        let error_msg = resp_body
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Unknown upstream error");
+
+                        tracing::warn!("Gemini upstream returned {} (attempt {}): {}", status_code, attempt, error_msg);
+
+                        Err(RetryableError::from_status(
+                            status_code,
+                            format!("{} {}", status_code, error_msg),
+                            &retry_config,
+                        ))
+                    }
+                }
+            })
+            .await
+            .map_err(|e| {
+                (StatusCode::BAD_GATEWAY, Json(json!({"error": {"message": e.message, "type": "upstream_error"}})))
+            })?;
+
             let resp_body = resp.json::<Value>().await.map_err(|e| {
                 (StatusCode::BAD_GATEWAY, Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})))
             })?;
-
-            if !status.is_success() {
-                let error_msg = resp_body
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown upstream error");
-                return Err((
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                    Json(json!({"error": {"message": error_msg, "type": "upstream_error"}})),
-                ));
-            }
 
             // Convert Gemini response → OpenAI format
             let text = resp_body
@@ -176,7 +269,7 @@ pub async fn chat_completions(
                 .unwrap_or("");
 
             let usage = resp_body.get("usageMetadata");
-            Ok(Json(json!({
+            json!({
                 "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..24].to_string()),
                 "object": "chat.completion",
                 "model": model_name,
@@ -186,11 +279,19 @@ pub async fn chat_completions(
                     "completion_tokens": usage.and_then(|u| u.get("candidatesTokenCount")).and_then(|t| t.as_u64()).unwrap_or(0),
                     "total_tokens": usage.and_then(|u| u.get("totalTokenCount")).and_then(|t| t.as_u64()).unwrap_or(0),
                 }
-            })))
+            })
         }
-        Publisher::Anthropic => Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": {"message": "Use /v1/messages for Anthropic models", "type": "invalid_request_error"}})),
-        )),
-    }
+        Publisher::Anthropic => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"message": "Use /v1/messages for Anthropic models", "type": "invalid_request_error"}})),
+            ));
+        }
+    };
+
+    let mut resp = Json(result_json).into_response();
+    resp.headers_mut().insert("X-RateLimit-Limit", HeaderValue::from_str(&rl_limit.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+    resp.headers_mut().insert("X-RateLimit-Remaining", HeaderValue::from_str(&rl_remaining.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+    resp.headers_mut().insert("X-RateLimit-Reset", HeaderValue::from_str(&rl_reset.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+    Ok(resp)
 }

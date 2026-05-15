@@ -3,6 +3,8 @@ mod auth;
 mod models;
 mod routes;
 mod transform;
+mod rate_limit;
+mod retry;
 
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -12,6 +14,7 @@ use tokio::sync::RwLock;
 
 use config::{Config, ModelConfig};
 use auth::AuthManager;
+use rate_limit::RateLimiter;
 
 /// Signature cache directory and file
 const SIGNATURE_CACHE_FILE: &str = "signature_cache.json";
@@ -100,7 +103,7 @@ impl SignatureCache {
                         let text_sigs: HashMap<String, serde_json::Value> = data.get("text_signatures")
                             .and_then(|v| serde_json::from_value(v.clone()).ok())
                             .unwrap_or_default();
-                        tracing::info!("Loaded {} tool signatures and {} text signatures from cache file", 
+                        tracing::info!("Loaded {} tool signatures and {} text signatures from cache file",
                             tool_sigs.len(), text_sigs.len());
                         (tool_sigs, text_sigs)
                     }
@@ -188,6 +191,7 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub signatures: SignatureCache,
     pub dynamic_models: DynamicModels,
+    pub rate_limiter: RateLimiter,
 }
 
 #[tokio::main]
@@ -208,12 +212,29 @@ async fn main() {
         .build()
         .expect("Failed to create HTTP client");
 
+    let rate_limiter = RateLimiter::new(config.rate_limit.clone());
+
+    // Spawn background cleanup task for rate limiter
+    if config.rate_limit.enabled {
+        let cleanup_limiter = rate_limiter.clone();
+        tokio::spawn(async move {
+            cleanup_limiter.cleanup_task().await;
+        });
+    }
+
+    let auth = AuthManager::new(client.clone());
+
+    // Spawn background token refresh — ensures token is always fresh
+    // This prevents requests from having to wait for synchronous token refresh
+    auth.spawn_background_refresh();
+
     let state = AppState {
         config: config.clone(),
-        auth: AuthManager::new(client.clone()),
+        auth,
         client,
         signatures: SignatureCache::new(&sig_cache_path),
         dynamic_models: Arc::new(RwLock::new(Vec::new())),
+        rate_limiter,
     };
 
     let app = Router::new()
@@ -225,6 +246,10 @@ async fn main() {
         .route("/admin/models", get(routes::admin::list_models))
         .route("/admin/models", post(routes::admin::add_model))
         .route("/admin/models/{name}", delete(routes::admin::delete_model))
+        // Admin API for rate limit status
+        .route("/admin/rate-limit", get(routes::admin::rate_limit_status))
+        // Admin API for auth/token diagnostics
+        .route("/admin/token-info", get(routes::admin::token_info))
         // VEO Video Generation API
         .route("/v1/veo/generate", post(routes::veo::generate))
         .route("/v1/veo/result", post(routes::veo::fetch_result))
@@ -238,6 +263,25 @@ async fn main() {
     tracing::info!("Vertex AI Proxy (Rust) starting on {addr}");
     tracing::info!("Static models loaded: {}", config.models.len());
     tracing::info!("Signature cache: {}", sig_cache_path);
+    tracing::info!("Rate limit: enabled={}, global={}/min, per_key={}/min, per_ip={}/min, burst={}",
+        config.rate_limit.enabled,
+        config.rate_limit.requests_per_minute,
+        config.rate_limit.requests_per_minute_per_key,
+        config.rate_limit.requests_per_minute_per_ip,
+        config.rate_limit.burst_size,
+    );
+    tracing::info!("Retry: enabled={}, max_retries={}, initial_delay={}ms, max_delay={}ms, backoff={}x, retry_on={:?}",
+        config.retry.enabled,
+        config.retry.max_retries,
+        config.retry.initial_delay_ms,
+        config.retry.max_delay_ms,
+        config.retry.backoff_multiplier,
+        config.retry.retry_on_statuses,
+    );
+    tracing::info!("Auth: background_refresh=enabled, refresh_buffer={}s, max_token_age={}s",
+        600, // REFRESH_BUFFER_SECS from auth.rs
+        3300, // MAX_TOKEN_AGE_SECS from auth.rs
+    );
     tracing::info!("Auto-resolve patterns: gemini-* → Google, veo-* → Google (VEO), claude-* → Anthropic, */* → OpenAPI");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

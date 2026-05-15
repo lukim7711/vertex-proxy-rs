@@ -1,5 +1,5 @@
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -9,6 +9,8 @@ use std::convert::Infallible;
 
 use crate::config::Config;
 use crate::models::{build_vertex_streaming_url, build_vertex_url, resolve_model, Publisher};
+use crate::rate_limit::RateLimitScope;
+use crate::retry::{with_retry, RetryableError};
 use crate::transform::{
     anthropic_to_gemini, anthropic_to_openai, gemini_stream::GeminiStreamState,
     openai_stream::OpenAiStreamState, sse_parser::SseParser,
@@ -38,6 +40,7 @@ fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Ev
         .as_str()
         .unwrap_or("end_turn")
         .to_string();
+    let usage = response.get("usage").cloned().unwrap_or(json!({"input_tokens": 0, "output_tokens": 0}));
 
     let mut events: Vec<Result<Event, Infallible>> = vec![Ok(Event::default()
         .event("message_start")
@@ -52,7 +55,7 @@ fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Ev
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": response.get("usage").cloned().unwrap_or(json!({"input_tokens": 0, "output_tokens": 0}))
+                    "usage": usage
                 }
             })
             .to_string(),
@@ -62,6 +65,33 @@ fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Ev
         for (i, block) in blocks.iter().enumerate() {
             let idx = i as u64;
             match block["type"].as_str() {
+                Some("thinking") => {
+                    let thinking_text = block["thinking"].as_str().unwrap_or("");
+                    events.push(Ok(Event::default().event("content_block_start").data(
+                        json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {"type": "thinking", "thinking": ""}
+                        })
+                        .to_string(),
+                    )));
+                    if !thinking_text.is_empty() {
+                        for chunk in thinking_text.as_bytes().chunks(256) {
+                            let partial = String::from_utf8_lossy(chunk).to_string();
+                            events.push(Ok(Event::default().event("content_block_delta").data(
+                                json!({
+                                    "type": "content_block_delta",
+                                    "index": idx,
+                                    "delta": {"type": "thinking_delta", "thinking": partial}
+                                })
+                                .to_string(),
+                            )));
+                        }
+                    }
+                    events.push(Ok(Event::default().event("content_block_stop").data(
+                        json!({"type": "content_block_stop", "index": idx}).to_string(),
+                    )));
+                }
                 Some("text") => {
                     let text = block["text"].as_str().unwrap_or("");
                     events.push(Ok(Event::default().event("content_block_start").data(
@@ -137,18 +167,24 @@ fn response_to_sse(response: Value) -> Sse<impl futures::Stream<Item = Result<Ev
         }
     }
 
+    let output_tokens = usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+
     events.push(Ok(Event::default().event("message_delta").data(
         json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-            "usage": {"output_tokens": response["usage"]["output_tokens"]}
+            "usage": {"output_tokens": output_tokens}
         })
         .to_string(),
     )));
+
     events.push(
         Ok(Event::default()
             .event("message_stop")
-            .data(json!({"type": "message_stop"}).to_string())),
+            .data(json!({
+                "type": "message_stop",
+                "usage": usage
+            }).to_string())),
     );
 
     Sse::new(futures::stream::iter(events))
@@ -180,12 +216,14 @@ fn stream_gemini(
     response: reqwest::Response,
     model: String,
     signatures: SignatureCache,
+    thinking_enabled: bool,
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
         let mut parser = SseParser::new();
         let mut state = GeminiStreamState::new(model);
+        state.set_thinking_enabled(thinking_enabled);
         let mut stream = response.bytes_stream();
 
         while let Some(chunk_result) = stream.next().await {
@@ -253,12 +291,14 @@ fn stream_gemini(
 fn stream_openai(
     response: reqwest::Response,
     model: String,
+    thinking_enabled: bool,
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
         let mut parser = SseParser::new();
         let mut state = OpenAiStreamState::new(model);
+        state.set_thinking_enabled(thinking_enabled);
         let mut stream = response.bytes_stream();
 
         while let Some(chunk_result) = stream.next().await {
@@ -308,15 +348,151 @@ fn stream_openai(
 }
 
 // ---------------------------------------------------------------------------
+// Upstream request with retry support
+// ---------------------------------------------------------------------------
+
+/// Send a request to Vertex AI with automatic retry on transient errors.
+/// Returns the response on success, or a RetryableError on failure.
+async fn send_with_retry(
+    state: &AppState,
+    url: &str,
+    token: &str,
+    body: &Value,
+) -> Result<reqwest::Response, RetryableError> {
+    let retry_config = &state.config.retry;
+
+    let result = with_retry(state, |attempt| {
+        let url = url.to_string();
+        let token = token.to_string();
+        let body = body.clone();
+        let client = state.client.clone();
+        let retry_config = retry_config.clone();
+
+        async move {
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| RetryableError::transport(format!("Upstream request failed: {e}")))?;
+
+            let status = resp.status();
+            if status.is_success() {
+                Ok(resp)
+            } else {
+                let status_code = status.as_u16();
+                // Read the error body for logging
+                let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
+                let error_msg = resp_body
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .or_else(|| {
+                        resp_body
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                    })
+                    .unwrap_or("Unknown upstream error");
+
+                tracing::warn!(
+                    "Upstream returned {} (attempt {}): {}",
+                    status_code,
+                    attempt,
+                    error_msg,
+                );
+
+                Err(RetryableError::from_status(
+                    status_code,
+                    format!("{} {}", status_code, error_msg),
+                    &retry_config,
+                ))
+            }
+        }
+    })
+    .await;
+
+    result
+}
+
+/// Extract error message from an upstream response body.
+#[allow(dead_code)]
+fn extract_error_msg(resp_body: &Value) -> String {
+    resp_body
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .or_else(|| {
+            resp_body
+                .get("error")
+                .and_then(|e| e.as_str())
+        })
+        .unwrap_or("Unknown upstream error")
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
 
 pub async fn messages(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     check_auth(&headers, &state.config)?;
+
+    // ── Rate limiting check ──────────────────────────────────────────
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        });
+
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim());
+
+    let rl_result = state.rate_limiter.check_and_record(api_key, ip).await;
+
+    if !rl_result.allowed {
+        let retry_after = rl_result.retry_after_secs.unwrap_or(30);
+        let scope_msg = match rl_result.scope {
+            RateLimitScope::Global => "Global rate limit exceeded",
+            RateLimitScope::PerKey => "Per-key rate limit exceeded",
+            RateLimitScope::PerIp => "Per-IP rate limit exceeded",
+            RateLimitScope::None => "Rate limit exceeded",
+        };
+
+        let mut response = axum::response::Response::new(
+            serde_json::to_string(&json!({
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": format!("{}. Retry after {} seconds.", scope_msg, retry_after)
+                }
+            }))
+            .unwrap_or_default()
+            .into(),
+        );
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        response.headers_mut().insert("Retry-After", HeaderValue::from_str(&retry_after.to_string()).unwrap_or_else(|_| HeaderValue::from_static("30")));
+        response.headers_mut().insert("X-RateLimit-Limit", HeaderValue::from_str(&rl_result.limit.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+        response.headers_mut().insert("X-RateLimit-Remaining", HeaderValue::from_str(&rl_result.remaining.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+        response.headers_mut().insert("X-RateLimit-Reset", HeaderValue::from_str(&rl_result.reset_at.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+        response.headers_mut().insert("Content-Type", HeaderValue::from_static("application/json"));
+        return Ok(response);
+    }
+
+    // Store rate limit info for adding to response headers later
+    let rl_limit = rl_result.limit;
+    let rl_remaining = rl_result.remaining;
+    let rl_reset = rl_result.reset_at;
 
     let model_name = body
         .get("model")
@@ -325,9 +501,13 @@ pub async fn messages(
 
     let is_streaming = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
+    // ── Extract thinking parameter ────────────────────────────────────
+    let thinking_param = body.get("thinking");
+
     tracing::info!(
-        "Request model={model_name} stream={is_streaming} max_tokens={:?}",
-        body.get("max_tokens").and_then(|t| t.as_u64())
+        "Request model={model_name} stream={is_streaming} max_tokens={:?} thinking={:?}",
+        body.get("max_tokens").and_then(|t| t.as_u64()),
+        thinking_param.is_some(),
     );
 
     let resolved = resolve_model(&state.config, &state.dynamic_models, model_name).await.map_err(|e| {
@@ -336,7 +516,7 @@ pub async fn messages(
 
     let (token, project_id) = state.auth.get_token().await.map_err(|e| {
         tracing::error!("Auth error: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e})))
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": {"type": "authentication_error", "message": format!("Failed to obtain auth token: {e}")}})))
     })?;
 
     let max_tokens = body
@@ -375,6 +555,10 @@ pub async fn messages(
 
                 let gemini_contents = anthropic_to_gemini::messages_to_gemini(messages, &state.signatures).await;
 
+                // Extract thinking config for Gemini
+                let (thinking_config, thinking_enabled) =
+                    anthropic_to_gemini::extract_thinking_config(thinking_param);
+
                 let mut gemini_body = json!({
                     "contents": gemini_contents,
                     "generationConfig": {"maxOutputTokens": max_tokens},
@@ -390,95 +574,25 @@ pub async fn messages(
                         json!(anthropic_to_gemini::tools_to_gemini(tools));
                 }
 
-                tracing::debug!("Gemini streaming request to {url}");
-                let resp = state
-                    .client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {token}"))
-                    .json(&gemini_body)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("Vertex AI streaming request failed: {e}");
-                        (
-                            StatusCode::BAD_GATEWAY,
-                            Json(json!({"error": format!("Upstream request failed: {e}")})),
-                        )
-                    })?;
-
-                let status = resp.status();
-                if !status.is_success() {
-                    // FIX BUG 5: Return error as SSE stream (not JSON) when client expects streaming
-                    let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
-                    let error_msg = resp_body
-                        .get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .or_else(|| {
-                            resp_body
-                                .get("error")
-                                .and_then(|e| e.as_str())
-                        })
-                        .unwrap_or("Unknown upstream error");
-                    tracing::error!("Vertex AI streaming error {status}: {error_msg}");
-
-                    // Return error as SSE events so Claude Code can parse it correctly
-                    let msg_id = format!("msg_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
-                    let error_events: Vec<Result<Event, Infallible>> = vec![
-                        Ok(Event::default().event("message_start").data(
-                            json!({
-                                "type": "message_start",
-                                "message": {
-                                    "id": msg_id,
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "model": model_name,
-                                    "content": [],
-                                    "stop_reason": null,
-                                    "stop_sequence": null,
-                                    "usage": {"input_tokens": 0, "output_tokens": 0}
-                                }
-                            })
-                            .to_string(),
-                        )),
-                        Ok(Event::default().event("content_block_start").data(
-                            json!({
-                                "type": "content_block_start",
-                                "index": 0,
-                                "content_block": {"type": "text", "text": ""}
-                            })
-                            .to_string(),
-                        )),
-                        Ok(Event::default().event("content_block_delta").data(
-                            json!({
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": format!("API Error: {} {}", status.as_u16(), error_msg)}
-                            })
-                            .to_string(),
-                        )),
-                        Ok(Event::default().event("content_block_stop").data(
-                            json!({"type": "content_block_stop", "index": 0}).to_string(),
-                        )),
-                        Ok(Event::default().event("message_delta").data(
-                            json!({
-                                "type": "message_delta",
-                                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-                                "usage": {"output_tokens": 0}
-                            })
-                            .to_string(),
-                        )),
-                        Ok(Event::default().event("message_stop").data(
-                            json!({"type": "message_stop"}).to_string(),
-                        )),
-                    ];
-                    let sse = Sse::new(futures::stream::iter(error_events));
-                    return Ok(sse.into_response());
+                // Add thinkingConfig if thinking mode is enabled
+                if let Some(tc) = thinking_config {
+                    gemini_body["generationConfig"]["thinkingConfig"] = tc;
                 }
 
+                tracing::debug!("Gemini streaming request to {url}");
+                let resp = send_with_retry(&state, &url, &token, &gemini_body).await.map_err(|e| {
+                    tracing::error!("Gemini streaming request failed after retries: {}", e.message);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": {"type": "upstream_error", "message": e.message}})),
+                    )
+                })?;
+
                 let model_name_owned = model_name.to_string();
-                let sse = stream_gemini(resp, model_name_owned, state.signatures.clone());
-                return Ok(sse.into_response());
+                let sse = stream_gemini(resp, model_name_owned, state.signatures.clone(), thinking_enabled);
+                let mut resp = sse.into_response();
+                add_rate_limit_headers(resp.headers_mut(), rl_limit, rl_remaining, rl_reset);
+                return Ok(resp);
             }
 
             Publisher::OpenApi => {
@@ -487,6 +601,10 @@ pub async fn messages(
                     .and_then(|t| t.as_array())
                     .map(|t| t.as_slice())
                     .unwrap_or(&[]);
+
+                // Extract thinking config for OpenAPI
+                let (thinking_config, thinking_enabled) =
+                    anthropic_to_openai::extract_thinking_config(thinking_param);
 
                 let mut openai_body = json!({
                     "model": resolved.vertex_name,
@@ -500,66 +618,29 @@ pub async fn messages(
                         json!(anthropic_to_openai::tools_to_openai(tools));
                 }
 
-                tracing::debug!("OpenAPI streaming request to {url}");
-                let resp = state
-                    .client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {token}"))
-                    .json(&openai_body)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("Vertex AI streaming request failed: {e}");
-                        (
-                            StatusCode::BAD_GATEWAY,
-                            Json(json!({"error": format!("Upstream request failed: {e}")})),
-                        )
-                    })?;
-
-                let status = resp.status();
-                if !status.is_success() {
-                    // FIX BUG 5: Return error as SSE stream for OpenAPI too
-                    let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
-                    let error_msg = resp_body
-                        .get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .or_else(|| {
-                            resp_body
-                                .get("error")
-                                .and_then(|e| e.as_str())
-                        })
-                        .unwrap_or("Unknown upstream error");
-                    tracing::error!("Vertex AI streaming error {status}: {error_msg}");
-
-                    let msg_id = format!("msg_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
-                    let error_events: Vec<Result<Event, Infallible>> = vec![
-                        Ok(Event::default().event("message_start").data(
-                            json!({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "model": model_name, "content": [], "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}).to_string(),
-                        )),
-                        Ok(Event::default().event("content_block_start").data(
-                            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}).to_string(),
-                        )),
-                        Ok(Event::default().event("content_block_delta").data(
-                            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": format!("API Error: {} {}", status.as_u16(), error_msg)}}).to_string(),
-                        )),
-                        Ok(Event::default().event("content_block_stop").data(
-                            json!({"type": "content_block_stop", "index": 0}).to_string(),
-                        )),
-                        Ok(Event::default().event("message_delta").data(
-                            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 0}}).to_string(),
-                        )),
-                        Ok(Event::default().event("message_stop").data(
-                            json!({"type": "message_stop"}).to_string(),
-                        )),
-                    ];
-                    let sse = Sse::new(futures::stream::iter(error_events));
-                    return Ok(sse.into_response());
+                // Merge thinking config into body (e.g., reasoning_effort)
+                if let Some(tc) = thinking_config {
+                    if let Value::Object(map) = tc {
+                        for (k, v) in map {
+                            openai_body[k] = v;
+                        }
+                    }
                 }
 
+                tracing::debug!("OpenAPI streaming request to {url}");
+                let resp = send_with_retry(&state, &url, &token, &openai_body).await.map_err(|e| {
+                    tracing::error!("OpenAPI streaming request failed after retries: {}", e.message);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": {"type": "upstream_error", "message": e.message}})),
+                    )
+                })?;
+
                 let model_name_owned = model_name.to_string();
-                let sse = stream_openai(resp, model_name_owned);
-                return Ok(sse.into_response());
+                let sse = stream_openai(resp, model_name_owned, thinking_enabled);
+                let mut resp = sse.into_response();
+                add_rate_limit_headers(resp.headers_mut(), rl_limit, rl_remaining, rl_reset);
+                return Ok(resp);
             }
 
             _ => unreachable!(),
@@ -575,6 +656,12 @@ pub async fn messages(
         &resolved.publisher,
         &resolved.vertex_name,
     );
+
+    // ── Parse thinking config once for non-streaming path ──────────
+    let (gemini_thinking_config, gemini_thinking_enabled) =
+        anthropic_to_gemini::extract_thinking_config(thinking_param);
+    let (openai_thinking_config, openai_thinking_enabled) =
+        anthropic_to_openai::extract_thinking_config(thinking_param);
 
     let result = match resolved.publisher {
         Publisher::OpenApi => {
@@ -592,41 +679,30 @@ pub async fn messages(
                 openai_body["tools"] = json!(anthropic_to_openai::tools_to_openai(tools));
             }
 
-            tracing::debug!("OpenAPI request to {url}");
-            let resp = state
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&openai_body)
-                .send()
-                .await
-                .map_err(|e| {
-                    tracing::error!("Vertex AI request failed: {e}");
-                    (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Upstream request failed: {e}")})))
-                })?;
+            // Merge thinking config into body (e.g., reasoning_effort)
+            if let Some(tc) = openai_thinking_config {
+                if let Value::Object(map) = tc {
+                    for (k, v) in map {
+                        openai_body[k] = v;
+                    }
+                }
+            }
 
-            let status = resp.status();
-            let resp_body = resp.json::<Value>().await.map_err(|e| {
-                (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Failed to parse upstream response: {e}")})))
+            tracing::debug!("OpenAPI request to {url}");
+            let resp = send_with_retry(&state, &url, &token, &openai_body).await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": {"type": "upstream_error", "message": e.message}})),
+                )
             })?;
 
-            if !status.is_success() {
-                let error_msg = resp_body
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .or_else(|| resp_body.get("error").and_then(|e| e.as_str()))
-                    .unwrap_or("Unknown upstream error");
-                tracing::error!("Vertex AI error {status}: {error_msg}");
-                return Err((
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                    Json(json!({"error": {"type": "upstream_error", "message": error_msg}})),
-                ));
-            }
+            let resp_body = resp.json::<Value>().await.map_err(|e| {
+                (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "upstream_error", "message": format!("Failed to parse upstream response: {e}")}})))
+            })?;
 
             tracing::debug!("OpenAPI raw response: {resp_body}");
 
-            anthropic_to_openai::response_to_anthropic(&resp_body, model_name)
+            anthropic_to_openai::response_to_anthropic(&resp_body, model_name, openai_thinking_enabled)
         }
 
         Publisher::Google => {
@@ -651,39 +727,24 @@ pub async fn messages(
                 gemini_body["tools"] = json!(anthropic_to_gemini::tools_to_gemini(tools));
             }
 
-            tracing::debug!("Gemini request to {url}");
-            let resp = state
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&gemini_body)
-                .send()
-                .await
-                .map_err(|e| {
-                    tracing::error!("Vertex AI request failed: {e}");
-                    (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Upstream request failed: {e}")})))
-                })?;
-
-            let status = resp.status();
-            let resp_body = resp.json::<Value>().await.map_err(|e| {
-                (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Failed to parse upstream response: {e}")})))
-            })?;
-
-            if !status.is_success() {
-                let error_msg = resp_body
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .or_else(|| resp_body.get("error").and_then(|e| e.as_str()))
-                    .unwrap_or("Unknown upstream error");
-                tracing::error!("Vertex AI error {status}: {error_msg}");
-                return Err((
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                    Json(json!({"error": {"type": "upstream_error", "message": error_msg}})),
-                ));
+            // Add thinkingConfig if thinking mode is enabled
+            if let Some(tc) = gemini_thinking_config {
+                gemini_body["generationConfig"]["thinkingConfig"] = tc;
             }
 
-            anthropic_to_gemini::response_to_anthropic(&resp_body, model_name, &state.signatures).await
+            tracing::debug!("Gemini request to {url}");
+            let resp = send_with_retry(&state, &url, &token, &gemini_body).await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": {"type": "upstream_error", "message": e.message}})),
+                )
+            })?;
+
+            let resp_body = resp.json::<Value>().await.map_err(|e| {
+                (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "upstream_error", "message": format!("Failed to parse upstream response: {e}")}})))
+            })?;
+
+            anthropic_to_gemini::response_to_anthropic(&resp_body, model_name, &state.signatures, gemini_thinking_enabled).await
         }
 
         Publisher::Anthropic => {
@@ -691,37 +752,19 @@ pub async fn messages(
             vertex_body["anthropic_version"] = json!("vertex-2023-10-16");
             // Remove stream field — Anthropic on Vertex doesn't support it the same way
             vertex_body.as_object_mut().map(|m| m.remove("stream"));
+            // Keep "thinking" parameter — Anthropic on Vertex AI natively supports it
 
             tracing::debug!("Anthropic passthrough to {url}");
-            let resp = state
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&vertex_body)
-                .send()
-                .await
-                .map_err(|e| {
-                    tracing::error!("Vertex AI request failed: {e}");
-                    (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Upstream request failed: {e}")})))
-                })?;
-
-            let status = resp.status();
-            let resp_body = resp.json::<Value>().await.map_err(|e| {
-                (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Failed to parse upstream response: {e}")})))
+            let resp = send_with_retry(&state, &url, &token, &vertex_body).await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": {"type": "upstream_error", "message": e.message}})),
+                )
             })?;
 
-            if !status.is_success() {
-                let error_msg = resp_body
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown upstream error");
-                tracing::error!("Vertex AI error {status}: {error_msg}");
-                return Err((
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                    Json(json!({"error": {"type": "upstream_error", "message": error_msg}})),
-                ));
-            }
+            let resp_body = resp.json::<Value>().await.map_err(|e| {
+                (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "upstream_error", "message": format!("Failed to parse upstream response: {e}")}})))
+            })?;
 
             resp_body
         }
@@ -729,10 +772,26 @@ pub async fn messages(
 
     if is_streaming {
         // Fake streaming fallback for Anthropic passthrough
-        Ok(response_to_sse(result).into_response())
+        let mut resp = response_to_sse(result).into_response();
+        add_rate_limit_headers(resp.headers_mut(), rl_limit, rl_remaining, rl_reset);
+        Ok(resp)
     } else {
-        Ok(Json(result).into_response())
+        let mut resp = Json(result).into_response();
+        add_rate_limit_headers(resp.headers_mut(), rl_limit, rl_remaining, rl_reset);
+        Ok(resp)
     }
+}
+
+/// Add rate limit headers to a response.
+fn add_rate_limit_headers(
+    headers: &mut axum::http::HeaderMap,
+    limit: u32,
+    remaining: u32,
+    reset_at: u64,
+) {
+    headers.insert("X-RateLimit-Limit", HeaderValue::from_str(&limit.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+    headers.insert("X-RateLimit-Remaining", HeaderValue::from_str(&remaining.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
+    headers.insert("X-RateLimit-Reset", HeaderValue::from_str(&reset_at.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")));
 }
 
 fn check_auth(

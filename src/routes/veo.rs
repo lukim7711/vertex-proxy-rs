@@ -1,7 +1,9 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::{HeaderMap, StatusCode}, Json};
 use serde_json::{json, Value};
 
 use crate::models::{build_veo_predict_url, build_veo_fetch_url};
+use crate::rate_limit::RateLimitScope;
+use crate::retry::{with_retry, RetryableError};
 use crate::AppState;
 
 /// Default VEO model if not specified
@@ -12,7 +14,7 @@ const DEFAULT_VEO_REGION: &str = "us-central1";
 // Auth helper (shared with other routes)
 // ---------------------------------------------------------------------------
 
-fn check_veo_auth(headers: &axum::http::HeaderMap, master_key: &str) -> Result<(), (StatusCode, Json<Value>)> {
+fn check_veo_auth(headers: &HeaderMap, master_key: &str) -> Result<(), (StatusCode, Json<Value>)> {
     let key = headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
@@ -35,27 +37,18 @@ fn check_veo_auth(headers: &axum::http::HeaderMap, master_key: &str) -> Result<(
 // ---------------------------------------------------------------------------
 // POST /v1/veo/generate — Submit video generation job
 // ---------------------------------------------------------------------------
-//
-// Request body:
-// {
-//   "model": "veo-3.1-fast-generate-001",     // optional, defaults to veo-3.1-fast-generate-001
-//   "region": "us-central1",                   // optional, defaults to us-central1
-//   "prompt": "A cat walking on a beach",       // required
-//   "negativePrompt": "",                        // optional
-//   "duration": 8,                              // optional, seconds (1-60)
-//   "resolution": "1080p",                      // optional: 480p, 720p, 1080p
-//   "aspectRatio": "16:9",                      // optional: 16:9, 9:16, 1:1
-//   "seed": 42,                                 // optional
-//   "numVideos": 1,                             // optional: 1-4
-//   "sampleCount": 1                            // optional (maps to parameters.sampleCount)
-// }
 
 pub async fn generate(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_veo_auth(&headers, &state.config.master_key)?;
+
+    // Rate limiting check
+    if let Some(rate_limit_err) = check_rate_limit(&state, &headers).await {
+        return Err(rate_limit_err);
+    }
 
     // Validate prompt
     let prompt = body
@@ -90,7 +83,7 @@ pub async fn generate(
         tracing::error!("Auth error: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": {"message": e, "type": "server_error"}})),
+            Json(json!({"error": {"message": format!("Failed to obtain auth token: {e}"), "type": "server_error"}})),
         )
     })?;
 
@@ -135,42 +128,62 @@ pub async fn generate(
 
     tracing::info!(model = model, region = region, prompt_len = prompt.len(), "VEO generate request");
 
-    let resp = state
-        .client
-        .post(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&veo_body)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("VEO predictLongRunning request failed: {e}");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": {"message": format!("Upstream request failed: {e}"), "type": "upstream_error"}})),
-            )
-        })?;
+    // Send with retry support
+    let retry_config = state.config.retry.clone();
+    let resp = with_retry(&state, |attempt| {
+        let url = url.clone();
+        let token = token.clone();
+        let veo_body = veo_body.clone();
+        let client = state.client.clone();
+        let retry_config = retry_config.clone();
 
-    let status = resp.status();
+        async move {
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&veo_body)
+                .send()
+                .await
+                .map_err(|e| RetryableError::transport(format!("VEO upstream request failed: {e}")))?;
+
+            let status = resp.status();
+            if status.is_success() {
+                Ok(resp)
+            } else {
+                let status_code = status.as_u16();
+                let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
+                let error_msg = resp_body
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .or_else(|| resp_body.get("error").and_then(|e| e.as_str()))
+                    .unwrap_or("Unknown upstream error");
+
+                tracing::warn!("VEO upstream returned {} (attempt {}): {}", status_code, attempt, error_msg);
+
+                Err(RetryableError::from_status(
+                    status_code,
+                    format!("{} {}", status_code, error_msg),
+                    &retry_config,
+                ))
+            }
+        }
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("VEO generate failed after retries: {}", e.message);
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": {"message": e.message, "type": "upstream_error"}})),
+        )
+    })?;
+
     let resp_body: Value = resp.json().await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": {"message": format!("Failed to parse upstream response: {e}"), "type": "upstream_error"}})),
         )
     })?;
-
-    if !status.is_success() {
-        let error_msg = resp_body
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .or_else(|| resp_body.get("error").and_then(|e| e.as_str()))
-            .unwrap_or("Unknown upstream error");
-        tracing::error!("VEO error {status}: {error_msg}");
-        return Err((
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(json!({"error": {"message": error_msg, "type": "upstream_error"}})),
-        ));
-    }
 
     // Extract operation name from response
     let operation_name = resp_body
@@ -192,20 +205,18 @@ pub async fn generate(
 // ---------------------------------------------------------------------------
 // POST /v1/veo/result — Poll for video generation result
 // ---------------------------------------------------------------------------
-//
-// Request body:
-// {
-//   "operationName": "projects/.../operations/abc123",   // required
-//   "model": "veo-3.1-fast-generate-001",               // optional, for URL building
-//   "region": "us-central1"                              // optional
-// }
 
 pub async fn fetch_result(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_veo_auth(&headers, &state.config.master_key)?;
+
+    // Rate limiting check
+    if let Some(rate_limit_err) = check_rate_limit(&state, &headers).await {
+        return Err(rate_limit_err);
+    }
 
     let operation_name = body
         .get("operationName")
@@ -232,7 +243,7 @@ pub async fn fetch_result(
         tracing::error!("Auth error: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": {"message": e, "type": "server_error"}})),
+            Json(json!({"error": {"message": format!("Failed to obtain auth token: {e}"), "type": "server_error"}})),
         )
     })?;
 
@@ -245,42 +256,62 @@ pub async fn fetch_result(
 
     tracing::debug!(operation = operation_name, "VEO fetch result");
 
-    let resp = state
-        .client
-        .post(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&fetch_body)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("VEO fetchPredictOperation request failed: {e}");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": {"message": format!("Upstream request failed: {e}"), "type": "upstream_error"}})),
-            )
-        })?;
+    // Send with retry support
+    let retry_config = state.config.retry.clone();
+    let resp = with_retry(&state, |attempt| {
+        let url = url.clone();
+        let token = token.clone();
+        let fetch_body = fetch_body.clone();
+        let client = state.client.clone();
+        let retry_config = retry_config.clone();
 
-    let status = resp.status();
+        async move {
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&fetch_body)
+                .send()
+                .await
+                .map_err(|e| RetryableError::transport(format!("VEO fetch upstream request failed: {e}")))?;
+
+            let status = resp.status();
+            if status.is_success() {
+                Ok(resp)
+            } else {
+                let status_code = status.as_u16();
+                let resp_body: Value = resp.json().await.unwrap_or(json!({"error": "Unknown error"}));
+                let error_msg = resp_body
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .or_else(|| resp_body.get("error").and_then(|e| e.as_str()))
+                    .unwrap_or("Unknown upstream error");
+
+                tracing::warn!("VEO fetch upstream returned {} (attempt {}): {}", status_code, attempt, error_msg);
+
+                Err(RetryableError::from_status(
+                    status_code,
+                    format!("{} {}", status_code, error_msg),
+                    &retry_config,
+                ))
+            }
+        }
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("VEO fetch failed after retries: {}", e.message);
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": {"message": e.message, "type": "upstream_error"}})),
+        )
+    })?;
+
     let resp_body: Value = resp.json().await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": {"message": format!("Failed to parse upstream response: {e}"), "type": "upstream_error"}})),
         )
     })?;
-
-    if !status.is_success() {
-        let error_msg = resp_body
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .or_else(|| resp_body.get("error").and_then(|e| e.as_str()))
-            .unwrap_or("Unknown upstream error");
-        tracing::error!("VEO fetch error {status}: {error_msg}");
-        return Err((
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(json!({"error": {"message": error_msg, "type": "upstream_error"}})),
-        ));
-    }
 
     // Check if operation is done
     let done = resp_body
@@ -310,21 +341,18 @@ pub async fn fetch_result(
 // ---------------------------------------------------------------------------
 // POST /v1/veo/generate-sync — Submit and auto-poll until complete
 // ---------------------------------------------------------------------------
-//
-// Same request body as /v1/veo/generate, but automatically polls until done
-// with a configurable timeout. This is a convenience endpoint for clients
-// that don't want to implement polling logic.
-//
-// Additional optional fields:
-//   "pollInterval": 5       // seconds between polls (default: 5)
-//   "maxPollTime": 300      // max seconds to wait (default: 300)
 
 pub async fn generate_sync(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_veo_auth(&headers, &state.config.master_key)?;
+
+    // Rate limiting check
+    if let Some(rate_limit_err) = check_rate_limit(&state, &headers).await {
+        return Err(rate_limit_err);
+    }
 
     let poll_interval_secs = body
         .get("pollInterval")
@@ -410,5 +438,50 @@ pub async fn generate_sync(
             elapsed = ?start.elapsed(),
             "VEO still processing, polling again"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting helper for VEO endpoints
+// ---------------------------------------------------------------------------
+
+async fn check_rate_limit(state: &AppState, headers: &HeaderMap) -> Option<(StatusCode, Json<Value>)> {
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        });
+
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim());
+
+    let rl_result = state.rate_limiter.check_and_record(api_key, ip).await;
+
+    if !rl_result.allowed {
+        let retry_after = rl_result.retry_after_secs.unwrap_or(30);
+        let scope_msg = match rl_result.scope {
+            RateLimitScope::Global => "Global rate limit exceeded",
+            RateLimitScope::PerKey => "Per-key rate limit exceeded",
+            RateLimitScope::PerIp => "Per-IP rate limit exceeded",
+            RateLimitScope::None => "Rate limit exceeded",
+        };
+        Some((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": format!("{}. Retry after {} seconds.", scope_msg, retry_after)
+                }
+            })),
+        ))
+    } else {
+        None
     }
 }

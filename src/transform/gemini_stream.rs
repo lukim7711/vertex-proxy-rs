@@ -12,20 +12,27 @@ use crate::SignatureCache;
 ///
 /// This state machine tracks:
 /// - Whether the `message_start` event has been sent
-/// - Whether a text content block is currently open
+/// - Whether a text/thinking content block is currently open
 /// - The current block index for multi-block responses
 /// - Tool use detection for proper `stop_reason`
 /// - Thought signatures for both functionCall AND text parts
+/// - Thinking mode: exposes Gemini's `thought: true` parts as thinking blocks
+/// - Token reporting: tracks input/output tokens for usage events
 pub struct GeminiStreamState {
     model: String,
     msg_id: String,
     block_index: u64,
     text_block_open: bool,
+    thinking_block_open: bool,
     has_tool_use: bool,
     input_tokens: u64,
     output_tokens: u64,
+    /// Token count consumed by thinking/reasoning (Gemini: thoughtsTokenCount)
+    thinking_tokens: u64,
     started: bool,
     finished: bool,
+    /// Whether thinking mode is enabled (client requested it)
+    thinking_enabled: bool,
     /// Accumulated thought_signature values from functionCall parts.
     /// (tool_id, signature)
     tool_thought_signatures: Vec<(String, Value)>,
@@ -41,14 +48,22 @@ impl GeminiStreamState {
             msg_id: format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]),
             block_index: 0,
             text_block_open: false,
+            thinking_block_open: false,
             has_tool_use: false,
             input_tokens: 0,
             output_tokens: 0,
+            thinking_tokens: 0,
             started: false,
             finished: false,
+            thinking_enabled: false,
             tool_thought_signatures: Vec::new(),
             text_thought_signatures: Vec::new(),
         }
+    }
+
+    /// Set whether thinking mode is enabled for this stream.
+    pub fn set_thinking_enabled(&mut self, enabled: bool) {
+        self.thinking_enabled = enabled;
     }
 
     /// Process a parsed Gemini JSON chunk and return zero or more Anthropic SSE events.
@@ -75,6 +90,11 @@ impl GeminiStreamState {
                 .get("candidatesTokenCount")
                 .and_then(|t| t.as_u64())
                 .unwrap_or(self.output_tokens);
+            // Track thinking tokens from Gemini's thoughtsTokenCount
+            self.thinking_tokens = um
+                .get("thoughtsTokenCount")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(self.thinking_tokens);
         }
 
         // Check for error in streaming response
@@ -92,19 +112,47 @@ impl GeminiStreamState {
                 if let Some(content) = first.get("content") {
                     if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
                         for part in parts {
-                            // Thought content — skip in output but preserve signature for round-trip
-                            if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
-                                continue;
-                            }
+                            let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
 
                             // Read thoughtSignature from Gemini part
                             let thought_sig = part.get("thoughtSignature")
                                 .or_else(|| part.get("thought_signature"))
                                 .cloned();
 
-                            // Text content (non-thought)
+                            // ── Thinking part ──────────────────────────────────
+                            if is_thought && self.thinking_enabled {
+                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        // Close text block if open (thinking comes before text)
+                                        if self.text_block_open {
+                                            events.push(self.close_block());
+                                            self.text_block_open = false;
+                                        }
+
+                                        if !self.thinking_block_open {
+                                            events.push(self.open_thinking_block());
+                                            self.thinking_block_open = true;
+                                        }
+                                        events.push(self.thinking_delta(text));
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Skip thought parts when thinking mode is NOT enabled
+                            if is_thought {
+                                continue;
+                            }
+
+                            // ── Text content (non-thought) ────────────────────
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
+                                    // Close thinking block if open (text comes after thinking)
+                                    if self.thinking_block_open {
+                                        events.push(self.close_block());
+                                        self.thinking_block_open = false;
+                                    }
+
                                     if !self.text_block_open {
                                         events.push(self.open_text_block());
                                         self.text_block_open = true;
@@ -119,9 +167,13 @@ impl GeminiStreamState {
                                 }
                             }
 
-                            // Function call
+                            // ── Function call ─────────────────────────────────
                             if let Some(fc) = part.get("functionCall") {
-                                // Close text block if open
+                                // Close any open block
+                                if self.thinking_block_open {
+                                    events.push(self.close_block());
+                                    self.thinking_block_open = false;
+                                }
                                 if self.text_block_open {
                                     events.push(self.close_block());
                                     self.text_block_open = false;
@@ -188,6 +240,10 @@ impl GeminiStreamState {
         }
         self.finished = true;
 
+        if self.thinking_block_open {
+            events.push(self.close_block());
+            self.thinking_block_open = false;
+        }
         if self.text_block_open {
             events.push(self.close_block());
             self.text_block_open = false;
@@ -220,7 +276,18 @@ impl GeminiStreamState {
         events.push(
             Event::default()
                 .event("message_stop")
-                .data(json!({"type": "message_stop"}).to_string()),
+                .data(
+                    json!({
+                        "type": "message_stop",
+                        "usage": {
+                            "input_tokens": self.input_tokens,
+                            "output_tokens": self.output_tokens,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0
+                        }
+                    })
+                    .to_string(),
+                ),
         );
 
         events
@@ -240,8 +307,35 @@ impl GeminiStreamState {
                         "content": [],
                         "stop_reason": null,
                         "stop_sequence": null,
-                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                        "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}
                     }
+                })
+                .to_string(),
+            )
+    }
+
+    fn open_thinking_block(&mut self) -> Event {
+        let idx = self.block_index;
+        Event::default()
+            .event("content_block_start")
+            .data(
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                })
+                .to_string(),
+            )
+    }
+
+    fn thinking_delta(&self, text: &str) -> Event {
+        Event::default()
+            .event("content_block_delta")
+            .data(
+                json!({
+                    "type": "content_block_delta",
+                    "index": self.block_index,
+                    "delta": {"type": "thinking_delta", "thinking": text}
                 })
                 .to_string(),
             )

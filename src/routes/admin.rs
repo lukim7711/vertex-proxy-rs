@@ -158,3 +158,15 @@ pub async fn delete_model(
         "message": format!("Model '{}' removed successfully", name)
     })))
 }
+
+/// GET /admin/rate-limit — Get current rate limit status
+pub async fn rate_limit_status(State(state): State<AppState>) -> Json<Value> {
+    let status = state.rate_limiter.get_status().await;
+    Json(serde_json::to_value(status).unwrap_or(json!({"error": "Failed to serialize rate limit status"})))
+}
+
+/// GET /admin/token-info — Get auth token diagnostics
+pub async fn token_info(State(state): State<AppState>) -> Json<Value> {
+    let info = state.auth.token_info().await;
+    Json(serde_json::to_value(info).unwrap_or(json!({"error": "Failed to serialize token info"})))
+}

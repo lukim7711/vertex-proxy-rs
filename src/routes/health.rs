@@ -7,12 +7,22 @@ use crate::models::collect_all_models;
 pub async fn health(State(state): State<AppState>) -> Json<Value> {
     let static_count = state.config.models.len();
     let dynamic_count = state.dynamic_models.read().await.len();
+    let token_info = state.auth.token_info().await;
 
     Json(json!({
         "status": "ok",
         "static_models": static_count,
         "dynamic_models": dynamic_count,
-        "auto_resolve_enabled": true
+        "auto_resolve_enabled": true,
+        "rate_limit_enabled": state.config.rate_limit.enabled,
+        "retry_enabled": state.config.retry.enabled,
+        "auth": {
+            "has_token": token_info.has_token,
+            "seconds_until_refresh": token_info.seconds_until_refresh,
+            "token_age_secs": token_info.token_age_secs,
+            "refresh_count": token_info.refresh_count,
+            "is_refreshing": token_info.is_refreshing,
+        }
     }))
 }
 

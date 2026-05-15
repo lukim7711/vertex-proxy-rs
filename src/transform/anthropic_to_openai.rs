@@ -139,13 +139,52 @@ fn extract_tool_result_text(content: Option<&Value>) -> String {
     }
 }
 
+/// Extract thinking parameter from Anthropic request and convert for OpenAI-compatible APIs.
+///
+/// Returns a tuple of (thinking_config_to_add_to_body, is_thinking_enabled).
+///
+/// For OpenAI-compatible APIs that support reasoning (DeepSeek, GLM, etc.),
+/// we can add parameters like `reasoning_effort` or custom fields.
+pub fn extract_thinking_config(thinking: Option<&Value>) -> (Option<Value>, bool) {
+    match thinking {
+        None => (None, false),
+        Some(Value::Null) => (None, false),
+        Some(Value::String(s)) if s == "enabled" || s == "adaptive" => {
+            // For OpenAPI, we pass a hint that reasoning is desired
+            (Some(json!({"reasoning_effort": "high"})), true)
+        }
+        Some(Value::Object(obj)) => {
+            let thinking_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if thinking_type == "enabled" || thinking_type == "adaptive" {
+                let budget = obj.get("budget_tokens").and_then(|b| b.as_u64()).unwrap_or(8192);
+                // Map budget to reasoning effort levels
+                let effort = if budget >= 16000 {
+                    "high"
+                } else if budget >= 4000 {
+                    "medium"
+                } else {
+                    "low"
+                };
+                (Some(json!({"reasoning_effort": effort})), true)
+            } else {
+                (None, false)
+            }
+        }
+        Some(other) => {
+            tracing::warn!(?other, "Unexpected thinking parameter format, ignoring");
+            (None, false)
+        }
+    }
+}
+
 /// OpenAI response → Anthropic format
 ///
 /// Handles model quirks:
 /// - GLM-5 may return `content: null` instead of a string
 /// - GLM-5 may return `tool_calls` with empty function names (not real tool calls)
 /// - Some models return `finish_reason: "tool_calls"` without valid tool_calls
-pub fn response_to_anthropic(response: &Value, model: &str) -> Value {
+/// - DeepSeek/GLM may return `reasoning_content` field for thinking
+pub fn response_to_anthropic(response: &Value, model: &str, thinking_enabled: bool) -> Value {
     let msg_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
     let choice = response
         .get("choices")
@@ -154,6 +193,20 @@ pub fn response_to_anthropic(response: &Value, model: &str) -> Value {
 
     let msg = choice.and_then(|c| c.get("message"));
     let mut content_blocks: Vec<Value> = Vec::new();
+
+    // ── Thinking/reasoning content ──────────────────────────────────
+    // Some OpenAI-compatible models (DeepSeek, GLM) return reasoning
+    // in a `reasoning_content` field alongside the regular `content`.
+    if thinking_enabled {
+        if let Some(reasoning) = msg.and_then(|m| m.get("reasoning_content")).and_then(|r| r.as_str()) {
+            if !reasoning.is_empty() {
+                content_blocks.push(json!({
+                    "type": "thinking",
+                    "thinking": reasoning
+                }));
+            }
+        }
+    }
 
     // Text content — handle both string and null
     if let Some(content_val) = msg.and_then(|m| m.get("content")) {
@@ -237,6 +290,8 @@ pub fn response_to_anthropic(response: &Value, model: &str) -> Value {
         "usage": {
             "input_tokens": usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
             "output_tokens": usage.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
         }
     })
 }

@@ -9,6 +9,10 @@ use uuid::Uuid;
 /// OpenAI streaming sends `chat.completion.chunk` objects with incremental
 /// `delta` fields. Tool calls come with incremental `function.arguments`.
 ///
+/// Supports:
+/// - Thinking mode via `reasoning_content` in delta (used by DeepSeek, GLM, etc.)
+/// - Token reporting via usage in final chunk
+///
 /// Handles quirks:
 /// - GLM-5 may return `tool_calls` with empty function names (skipped as hallucinations)
 /// - Some models return `finish_reason: "tool_calls"` without valid tool_calls
@@ -18,6 +22,7 @@ pub struct OpenAiStreamState {
     msg_id: String,
     block_index: u64,
     text_block_open: bool,
+    thinking_block_open: bool,
     /// Tracks which OpenAI tool_call index maps to which Anthropic block
     /// and stores (tool_id, tool_name)
     active_tools: HashMap<u64, (String, String)>,
@@ -28,6 +33,8 @@ pub struct OpenAiStreamState {
     output_tokens: u64,
     started: bool,
     finished: bool,
+    /// Whether thinking mode is enabled (client requested it)
+    thinking_enabled: bool,
 }
 
 impl OpenAiStreamState {
@@ -37,6 +44,7 @@ impl OpenAiStreamState {
             msg_id: format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]),
             block_index: 0,
             text_block_open: false,
+            thinking_block_open: false,
             active_tools: HashMap::new(),
             current_tool_index: None,
             has_tool_use: false,
@@ -44,7 +52,13 @@ impl OpenAiStreamState {
             output_tokens: 0,
             started: false,
             finished: false,
+            thinking_enabled: false,
         }
+    }
+
+    /// Set whether thinking mode is enabled for this stream.
+    pub fn set_thinking_enabled(&mut self, enabled: bool) {
+        self.thinking_enabled = enabled;
     }
 
     /// Process a parsed OpenAI streaming chunk and return zero or more Anthropic SSE events.
@@ -82,9 +96,36 @@ impl OpenAiStreamState {
                 let finish_reason = choice.get("finish_reason");
 
                 if let Some(delta) = delta {
-                    // Text content delta
+                    // ── Reasoning/thinking content ──────────────────────
+                    // Some OpenAI-compatible models (DeepSeek, GLM, etc.)
+                    // return reasoning in `reasoning_content` field within delta
+                    if self.thinking_enabled {
+                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+                            if !reasoning.is_empty() {
+                                // Close text block if open (thinking comes before text)
+                                if self.text_block_open {
+                                    events.push(self.close_block());
+                                    self.text_block_open = false;
+                                }
+
+                                if !self.thinking_block_open {
+                                    events.push(self.open_thinking_block());
+                                    self.thinking_block_open = true;
+                                }
+                                events.push(self.thinking_delta(reasoning));
+                            }
+                        }
+                    }
+
+                    // ── Text content delta ──────────────────────────────
                     if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                         if !content.is_empty() {
+                            // Close thinking block if open (text comes after thinking)
+                            if self.thinking_block_open {
+                                events.push(self.close_block());
+                                self.thinking_block_open = false;
+                            }
+
                             if !self.text_block_open {
                                 events.push(self.open_text_block());
                                 self.text_block_open = true;
@@ -93,7 +134,7 @@ impl OpenAiStreamState {
                         }
                     }
 
-                    // Tool calls delta
+                    // ── Tool calls delta ────────────────────────────────
                     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                         for tc in tool_calls {
                             let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
@@ -115,7 +156,11 @@ impl OpenAiStreamState {
                                     continue;
                                 }
 
-                                // Close text block if open
+                                // Close any open blocks
+                                if self.thinking_block_open {
+                                    events.push(self.close_block());
+                                    self.thinking_block_open = false;
+                                }
                                 if self.text_block_open {
                                     events.push(self.close_block());
                                     self.text_block_open = false;
@@ -183,6 +228,12 @@ impl OpenAiStreamState {
         }
         self.finished = true;
 
+        // Close thinking block if open
+        if self.thinking_block_open {
+            events.push(self.close_block());
+            self.thinking_block_open = false;
+        }
+
         // Close text block if open
         if self.text_block_open {
             events.push(self.close_block());
@@ -221,7 +272,18 @@ impl OpenAiStreamState {
         events.push(
             Event::default()
                 .event("message_stop")
-                .data(json!({"type": "message_stop"}).to_string()),
+                .data(
+                    json!({
+                        "type": "message_stop",
+                        "usage": {
+                            "input_tokens": self.input_tokens,
+                            "output_tokens": self.output_tokens,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0
+                        }
+                    })
+                    .to_string(),
+                ),
         );
 
         events
@@ -241,8 +303,35 @@ impl OpenAiStreamState {
                         "content": [],
                         "stop_reason": null,
                         "stop_sequence": null,
-                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                        "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}
                     }
+                })
+                .to_string(),
+            )
+    }
+
+    fn open_thinking_block(&mut self) -> Event {
+        let idx = self.block_index;
+        Event::default()
+            .event("content_block_start")
+            .data(
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                })
+                .to_string(),
+            )
+    }
+
+    fn thinking_delta(&self, text: &str) -> Event {
+        Event::default()
+            .event("content_block_delta")
+            .data(
+                json!({
+                    "type": "content_block_delta",
+                    "index": self.block_index,
+                    "delta": {"type": "thinking_delta", "thinking": text}
                 })
                 .to_string(),
             )

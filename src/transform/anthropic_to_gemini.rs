@@ -225,13 +225,58 @@ fn extract_tool_result_text(content: Option<&Value>) -> String {
     }
 }
 
+/// Extract thinking parameter from Anthropic request body and convert to
+/// Gemini's thinkingConfig format.
+///
+/// Anthropic thinking modes:
+/// - `"enabled"` or `{"type": "enabled", "budget_tokens": N}` → enable thinking
+/// - `"adaptive"` → enable adaptive thinking
+///
+/// Gemini thinkingConfig:
+/// - `{"thinkingConfig": {"thinkingBudget": N}}` where 0 = disabled, >0 = enabled
+/// - If no budget specified, uses a default of 8192 tokens
+pub fn extract_thinking_config(thinking: Option<&Value>) -> (Option<Value>, bool) {
+    match thinking {
+        None => (None, false),
+        Some(Value::Null) => (None, false),
+        Some(Value::String(s)) if s == "enabled" || s == "adaptive" => {
+            let budget = 8192u64; // Default budget when no specific value given
+            (Some(json!({"thinkingBudget": budget})), true)
+        }
+        Some(Value::Object(obj)) => {
+            let thinking_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if thinking_type == "enabled" || thinking_type == "adaptive" {
+                let budget = obj.get("budget_tokens")
+                    .and_then(|b| b.as_u64())
+                    .unwrap_or(8192);
+                (Some(json!({"thinkingBudget": budget})), true)
+            } else {
+                (None, false)
+            }
+        }
+        Some(other) => {
+            // Unexpected format — try to interpret as enabled
+            tracing::warn!(?other, "Unexpected thinking parameter format, ignoring");
+            (None, false)
+        }
+    }
+}
+
 /// Gemini API response → Anthropic format.
 /// Also stores thought signatures in the server-side cache for round-trip.
+///
+/// Supports thinking mode: Gemini parts with `"thought": true` are exposed
+/// as Anthropic `thinking` content blocks when thinking mode was requested.
 ///
 /// FIX BUG 1: Now includes `_thought_signature` in tool_use blocks.
 /// FIX BUG 2: Now stores signatures synchronously (no tokio::spawn).
 /// FIX BUG 4: Now stores text part signatures too.
-pub async fn response_to_anthropic(response: &Value, model: &str, signatures: &SignatureCache) -> Value {
+pub async fn response_to_anthropic(
+    response: &Value,
+    model: &str,
+    signatures: &SignatureCache,
+    thinking_enabled: bool,
+) -> Value {
     let msg_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
 
     let candidates = response.get("candidates").and_then(|c| c.as_array());
@@ -265,9 +310,23 @@ pub async fn response_to_anthropic(response: &Value, model: &str, signatures: &S
                     .unwrap_or(&empty_vec);
 
                 for part in parts {
-                    // Skip thought parts — internal Gemini reasoning that should not
-                    // be exposed to the client. These have "thought": true at the part level.
-                    if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                    let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
+
+                    // ── Thinking part ──────────────────────────────────────
+                    if is_thought && thinking_enabled {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            if !text.is_empty() {
+                                content_blocks.push(json!({
+                                    "type": "thinking",
+                                    "thinking": text
+                                }));
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Skip thought parts when thinking mode is NOT enabled
+                    if is_thought {
                         continue;
                     }
 
@@ -325,9 +384,15 @@ pub async fn response_to_anthropic(response: &Value, model: &str, signatures: &S
         finish_reason
     };
 
+    // Extract token usage including thinking tokens from Gemini
+    let cache_creation_input_tokens = 0u64;
+    let mut cache_read_input_tokens = 0u64;
+
     if let Some(um) = response.get("usageMetadata") {
         input_tokens = um.get("promptTokenCount").and_then(|t| t.as_u64()).unwrap_or(0);
         output_tokens = um.get("candidatesTokenCount").and_then(|t| t.as_u64()).unwrap_or(0);
+        // Gemini may provide cachedContentTokenCount for cache read tokens
+        cache_read_input_tokens = um.get("cachedContentTokenCount").and_then(|t| t.as_u64()).unwrap_or(0);
     }
 
     json!({
@@ -340,6 +405,8 @@ pub async fn response_to_anthropic(response: &Value, model: &str, signatures: &S
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
         }
     })
 }
